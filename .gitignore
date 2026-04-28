@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+
+# Agent build output (created by deploy.sh, used as CDK asset)
+.build/
+
+# CDK build output
+cdk.out/
+
+# CDK context (account-specific)
+cdk.context.json
+
+# CDK deploy outputs (account-specific)
+cdk-outputs.json
+
+# Seed script output (generated session IDs)
+scripts/seed-output.json
+
+# TypeScript build
+*.js
+*.d.ts
+*.js.map
+!jest.config.js
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Security review output (internal only)
+security-review/
+
+# Toolkit templates (internal only)
+templates/
+
+# Toolkit config (internal only)
+.kiro/
+.claude/
+.mcp.json
+.pre-commit-config.yaml
+
+# ASH scan output
+.ash/
+
+# Sensitive files
+.env*
+*.pem
+*.key
+**/credentials
+**/credentials.json
+**/.aws/
+
+# Local-only UI for manual testing (not part of the reference architecture)
+local-frontend/
