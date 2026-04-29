@@ -94,6 +94,8 @@ if [ -f cdk-outputs.json ]; then
   echo "  export USER_POOL_CLIENT_ID=\"${USER_POOL_CLIENT_ID}\""
   echo "  export THROTTLE_TABLE_NAME=\"${THROTTLE_TABLE_NAME}\""
   echo "  export AWS_REGION=\"${REGION}\""
+  echo "  export VPC_ID=\"${VPC_ID}\""
+ 
 else
   echo "  (cdk-outputs.json not found — check CDK deploy output above)"
 fi
