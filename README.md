@@ -1,8 +1,8 @@
-# Securing Amazon Bedrock AgentCore Runtime — CDK Reference Architecture
+# Securely Exposing Amazon Bedrock AgentCore Runtime via API Gateway
 
 **Disclaimer**: This is sample code, for non-production usage. You should work with your security and legal teams to meet your organizational security, regulatory and compliance requirements before deployment.
 
-An example architecture for exposing [Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore.html) via [Amazon API Gateway](https://docs.aws.amazon.com/apigateway/latest/developerguide/welcome.html), deployed as a single AWS CDK stack. This sample demonstrates five security best practices for production agent deployments.
+An example AWS CDK architecture for exposing [Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock/latest/userguide/agentcore.html) via a public [Amazon API Gateway](https://docs.aws.amazon.com/apigateway/latest/developerguide/welcome.html), deployed as a single AWS CDK stack. This sample demonstrates five security best practices for production agent deployments, including session validation and rate limiting.
 
 ## Architecture
 
@@ -56,21 +56,24 @@ sequenceDiagram
 ## Security Controls
 
 ### 1. Inbound Security
+
 All requests pass through a REST API Gateway with a REQUEST-type Lambda Authorizer. The authorizer validates Cognito-issued JWTs (signature, expiry, issuer) and the UUID v4 format of the `X-Session-Id` header before allowing any request through. No request reaches the agent without passing all checks.
 
 ### 2. Outbound Security
+
 The Proxy Lambda runs in a VPC with private subnets only, no Internet Gateway and no NAT Gateway. The only reachable services are those with configured VPC endpoints (DynamoDB, CloudWatch, Bedrock AgentCore, Lambda). No Lambda function in the VPC can reach the internet.
 
 ### 3. Runtime Direct Access Prevention
+
 Two independent gates prevent anyone from bypassing API Gateway to reach the Runtime directly:
 
-1. **VPC endpoint policy** — the Bedrock AgentCore VPC endpoint has an IAM policy that allows only the Proxy Lambda's execution role to invoke the Runtime. An explicit Deny statement blocks all other principals. This controls *who can use the endpoint*.
-2. **Runtime resource-based policy** — applied to both the Runtime and its `DEFAULT` endpoint via a CDK `AwsCustomResource`. It denies any invocation whose `aws:SourceVpce` does not match this stack's endpoint. This controls *what the Runtime itself accepts*, independent of the network path. Even if another principal in the account gained `bedrock-agentcore:InvokeAgentRuntime` and a different network path, the Runtime would still reject the call.
+1. **VPC endpoint policy** — the Bedrock AgentCore VPC endpoint has an IAM policy that allows only the Proxy Lambda's execution role to invoke the Runtime. An explicit Deny statement blocks all other principals. This controls _who can use the endpoint_.
+2. **Runtime resource-based policy** — applied to both the Runtime and its `DEFAULT` endpoint via a CDK `AwsCustomResource`. It denies any invocation whose `aws:SourceVpce` does not match this stack's endpoint. This controls _what the Runtime itself accepts_, independent of the network path. Even if another principal in the account gained `bedrock-agentcore:InvokeAgentRuntime` and a different network path, the Runtime would still reject the call.
 
 Together these give two layers: compromise of one does not expose the Runtime. Direct invocations from outside the VPC (for example, `scripts/test-agent-direct.ts` from a developer laptop) are rejected with `AccessDeniedException` — the only valid path is **API Gateway → Authorizer → Proxy Lambda → VPC endpoint → Runtime**.
 
-
 ### 5. Rate Limiting & Throttling
+
 The Lambda Authorizer enforces per-user session limits and per-session invocation limits using DynamoDB atomic counters. This prevents resource exhaustion and cost abuse:
 
 - **Max sessions per user** (default: 5), prevents a single user from creating unlimited agent sessions
@@ -134,6 +137,7 @@ chmod +x scripts/deploy.sh
 ```
 
 The deploy script will:
+
 - Install dependencies
 - Bootstrap CDK (if needed)
 - Deploy the `AgentCoreSecurityStack`
@@ -201,14 +205,15 @@ chmod +x scripts/test-security-controls.sh
 
 The `scripts/test-security-controls.sh` script validates the security controls against the deployed stack:
 
-| Test | What it does | Expected result |
-|------|-------------|-----------------|
-| Outbound Security | Checks VPC has no IGW and no NAT | 0 gateways found |
-| Runtime Direct Access | Sends request without Authorization header | 401 (blocked at API Gateway) |
-| Invalid Session Format | Sends a non-UUID `X-Session-Id` | 403 (authorizer denies) |
-| Session Isolation | Sends User2's JWT with User1's UUID | 200 (allowed — composite hash isolates) |
+| Test                   | What it does                               | Expected result                         |
+| ---------------------- | ------------------------------------------ | --------------------------------------- |
+| Outbound Security      | Checks VPC has no IGW and no NAT           | 0 gateways found                        |
+| Runtime Direct Access  | Sends request without Authorization header | 401 (blocked at API Gateway)            |
+| Invalid Session Format | Sends a non-UUID `X-Session-Id`            | 403 (authorizer denies)                 |
+| Session Isolation      | Sends User2's JWT with User1's UUID        | 200 (allowed — composite hash isolates) |
 
 Required environment variables:
+
 ```bash
 API_URL, USER_POOL_ID, USER_POOL_CLIENT_ID, AWS_REGION, VPC_ID
 ```
@@ -222,6 +227,7 @@ npm test
 ```
 
 These tests verify:
+
 - Proxy Lambda has no DynamoDB dependency (no `THROTTLE_TABLE_NAME` env var)
 - Proxy Lambda source code has no session validation logic
 - Authorizer source has no `SessionRecord` / binding lookup
@@ -283,19 +289,19 @@ curl -X POST "${API_URL}invoke" \
 
 ## Resources Deployed
 
-| Resource | Purpose |
-|----------|---------|
-| VPC (private subnets only) | Network isolation, no internet egress |
-| VPC Endpoints (DynamoDB, CloudWatch, Lambda, Bedrock AgentCore) | Private connectivity to AWS services |
-| Cognito User Pool + Client | JWT-based authentication |
-| DynamoDB Throttle Table | Per-user session counters and per-session invocation counters (no session binding) |
-| Lambda Authorizer | JWT validation + composite session hashing + throttling |
-| Proxy Lambda (in VPC) | Thin pass-through to AgentCore Runtime |
-| REST API Gateway | Single entry point with custom authorizer |
-| AgentCore Runtime + Strands Agent | AI agent hosted on Bedrock AgentCore |
-| CloudWatch Log Groups | Structured audit logging |
-| CloudWatch Metric Filter | INVALID_JWT detection |
-| CloudWatch Alarm | Alert on high invalid-JWT rates |
+| Resource                                                        | Purpose                                                                            |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| VPC (private subnets only)                                      | Network isolation, no internet egress                                              |
+| VPC Endpoints (DynamoDB, CloudWatch, Lambda, Bedrock AgentCore) | Private connectivity to AWS services                                               |
+| Cognito User Pool + Client                                      | JWT-based authentication                                                           |
+| DynamoDB Throttle Table                                         | Per-user session counters and per-session invocation counters (no session binding) |
+| Lambda Authorizer                                               | JWT validation + composite session hashing + throttling                            |
+| Proxy Lambda (in VPC)                                           | Thin pass-through to AgentCore Runtime                                             |
+| REST API Gateway                                                | Single entry point with custom authorizer                                          |
+| AgentCore Runtime + Strands Agent                               | AI agent hosted on Bedrock AgentCore                                               |
+| CloudWatch Log Groups                                           | Structured audit logging                                                           |
+| CloudWatch Metric Filter                                        | INVALID_JWT detection                                                              |
+| CloudWatch Alarm                                                | Alert on high invalid-JWT rates                                                    |
 
 ## Cleanup
 
@@ -328,7 +334,7 @@ The controls shipped in this stack stop a JWT-authenticated user from reaching A
 
 ### 1. AWS WAF in front of API Gateway
 
-Associate an AWS WAF Web ACL with the REST API stage to inspect requests *before* they reach the Lambda Authorizer. Recommended rule set:
+Associate an AWS WAF Web ACL with the REST API stage to inspect requests _before_ they reach the Lambda Authorizer. Recommended rule set:
 
 - **AWSManagedRulesCommonRuleSet** — generic OWASP protections (XSS, LFI, RFI, bad bots).
 - **AWSManagedRulesSQLiRuleSet** — SQL injection signatures on the body, query string, and headers. The agent prompt body is untrusted free-form text, so this is the rule set that directly addresses the "user prompt carrying injection payloads" threat model.
@@ -339,18 +345,67 @@ Associate an AWS WAF Web ACL with the REST API stage to inspect requests *before
 CDK sketch:
 
 ```typescript
-const webAcl = new wafv2.CfnWebACL(this, 'ApiWebAcl', {
-  scope: 'REGIONAL',
+const webAcl = new wafv2.CfnWebACL(this, "ApiWebAcl", {
+  scope: "REGIONAL",
   defaultAction: { allow: {} },
-  visibilityConfig: { cloudWatchMetricsEnabled: true, metricName: 'ApiWebAcl', sampledRequestsEnabled: true },
+  visibilityConfig: {
+    cloudWatchMetricsEnabled: true,
+    metricName: "ApiWebAcl",
+    sampledRequestsEnabled: true,
+  },
   rules: [
-    { name: 'AWS-Common',        priority: 0, overrideAction: { none: {} }, statement: { managedRuleGroupStatement: { vendorName: 'AWS', name: 'AWSManagedRulesCommonRuleSet' } },        visibilityConfig: { cloudWatchMetricsEnabled: true, metricName: 'AWS-Common',        sampledRequestsEnabled: true } },
-    { name: 'AWS-SQLi',          priority: 1, overrideAction: { none: {} }, statement: { managedRuleGroupStatement: { vendorName: 'AWS', name: 'AWSManagedRulesSQLiRuleSet' } },           visibilityConfig: { cloudWatchMetricsEnabled: true, metricName: 'AWS-SQLi',          sampledRequestsEnabled: true } },
-    { name: 'AWS-KnownBadInputs', priority: 2, overrideAction: { none: {} }, statement: { managedRuleGroupStatement: { vendorName: 'AWS', name: 'AWSManagedRulesKnownBadInputsRuleSet' } }, visibilityConfig: { cloudWatchMetricsEnabled: true, metricName: 'AWS-KnownBadInputs', sampledRequestsEnabled: true } },
+    {
+      name: "AWS-Common",
+      priority: 0,
+      overrideAction: { none: {} },
+      statement: {
+        managedRuleGroupStatement: {
+          vendorName: "AWS",
+          name: "AWSManagedRulesCommonRuleSet",
+        },
+      },
+      visibilityConfig: {
+        cloudWatchMetricsEnabled: true,
+        metricName: "AWS-Common",
+        sampledRequestsEnabled: true,
+      },
+    },
+    {
+      name: "AWS-SQLi",
+      priority: 1,
+      overrideAction: { none: {} },
+      statement: {
+        managedRuleGroupStatement: {
+          vendorName: "AWS",
+          name: "AWSManagedRulesSQLiRuleSet",
+        },
+      },
+      visibilityConfig: {
+        cloudWatchMetricsEnabled: true,
+        metricName: "AWS-SQLi",
+        sampledRequestsEnabled: true,
+      },
+    },
+    {
+      name: "AWS-KnownBadInputs",
+      priority: 2,
+      overrideAction: { none: {} },
+      statement: {
+        managedRuleGroupStatement: {
+          vendorName: "AWS",
+          name: "AWSManagedRulesKnownBadInputsRuleSet",
+        },
+      },
+      visibilityConfig: {
+        cloudWatchMetricsEnabled: true,
+        metricName: "AWS-KnownBadInputs",
+        sampledRequestsEnabled: true,
+      },
+    },
   ],
 });
 
-new wafv2.CfnWebACLAssociation(this, 'ApiWebAclAssoc', {
+new wafv2.CfnWebACLAssociation(this, "ApiWebAclAssoc", {
   resourceArn: `arn:aws:apigateway:${this.region}::/restapis/${api.restApiId}/stages/${api.deploymentStage.stageName}`,
   webAclArn: webAcl.attrArn,
 });
@@ -376,7 +431,7 @@ Policy (deny-only guardrail — same-account callers are already granted via ide
       "Resource": "arn:aws:bedrock-agentcore:<region>:<account-id>:runtime/<AGENT_RUNTIME_ID>",
       "Condition": {
         "StringNotEquals": { "aws:SourceVpce": "<bedrock-agentcore-vpce-id>" },
-        "Bool":           { "aws:ViaAWSService": "false" }
+        "Bool": { "aws:ViaAWSService": "false" }
       }
     }
   ]
@@ -384,10 +439,11 @@ Policy (deny-only guardrail — same-account callers are already granted via ide
 ```
 
 Notes:
+
 - No explicit Allow is needed for same-account principals — the Proxy Lambda role's identity policy already grants `bedrock-agentcore:InvokeAgentRuntime`. Resource-policy Allows are only required for cross-account access. The Deny above is pure perimeter enforcement: "reject anything not coming through this VPCE, regardless of caller identity."
 - Because AgentCore Runtime authorization is evaluated at both the runtime and the endpoint, the same policy is attached to the runtime **and** to its `DEFAULT` endpoint (`arn:…:runtime/<ID>/runtime-endpoint/DEFAULT`). Without both, the request is denied.
 - The `Resource` field must match the ARN of the resource the policy is attached to — wildcards are rejected by the service.
-- `aws:SourceVpce` is the condition key that constrains invocations to traffic arriving through the specific interface endpoint created by this stack. Combined with the existing endpoint *policy* (which gates who can use the endpoint), this gives two independent gates: "who can reach the endpoint" and "what the Runtime accepts."
+- `aws:SourceVpce` is the condition key that constrains invocations to traffic arriving through the specific interface endpoint created by this stack. Combined with the existing endpoint _policy_ (which gates who can use the endpoint), this gives two independent gates: "who can reach the endpoint" and "what the Runtime accepts."
 - `aws:ViaAWSService: false` preserves the normal escape hatch for AWS-internal service-to-service calls.
 
 > **Note — `scripts/test-agent-direct.ts` will fail once this policy is in place.** That script invokes AgentCore Runtime directly from your local AWS credentials over the public internet. With the resource policy attached, the call does not come through the VPC endpoint, so the Runtime rejects it with `AccessDeniedException`. **This is expected behavior** — it's exactly the property the policy is meant to provide. The only valid path to the Runtime is now: **API Gateway → Lambda Authorizer → Proxy Lambda (in VPC) → Bedrock AgentCore VPC endpoint → AgentCore Runtime.**
