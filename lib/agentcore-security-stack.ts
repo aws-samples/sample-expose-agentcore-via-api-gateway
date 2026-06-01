@@ -1,16 +1,28 @@
 /**
- * AgentCoreSecurityStack — defense-in-depth security for Amazon Bedrock AgentCore Runtime.
+ * AgentCoreSecurityStack — defense-in-depth for Amazon Bedrock AgentCore Runtime.
  *
- * Single CDK stack deploying: VPC (private-only), Cognito, DynamoDB throttle
- * table, Lambda Authorizer, thin proxy Lambda, REST API Gateway, VPC endpoints,
- * and CloudWatch monitoring. All security controls live on the customer side.
+ * Architecture:
+ *   API Gateway → Lambda Authorizer → Proxy Lambda (in private VPC)
+ *   → bedrock-agentcore VPC endpoint → AgentCore Runtime (OAuth inbound)
  *
- * Security best practices implemented:
- *   1. Inbound security — API Gateway + Lambda Authorizer (JWT validation)
- *   2. Outbound security — VPC with no IGW/NAT (no internet egress)
- *   3. Runtime access prevention — VPC endpoint policies (proxy Lambda role only)
- *   4. Session isolation — composite session ID = sha256(uuid:jwtSub)
- *   5. Throttling — per-user session limit + per-session invocation limit
+ * The user's Cognito JWT is validated twice — once at API Gateway by a
+ * custom Lambda Authorizer (which also enforces UUID v4 on X-Session-Id,
+ * computes a user-bound composite session ID, and applies per-user /
+ * per-session throttling), and again at AgentCore Runtime by AgentCore
+ * Identity using the Cognito user pool's discovery URL. The Proxy Lambda
+ * forwards the user's JWT unchanged (no SigV4) and exists solely to give
+ * the call a VPC-resident origin so the AgentCore Runtime resource-based
+ * policy can enforce `aws:SourceVpc`.
+ *
+ * Customer-side controls implemented:
+ *   1. JWT validation at API Gateway — Lambda Authorizer + Cognito JWKS
+ *   2. Session ownership binding     — runtimeSessionId = sha256(uuid:jwtSub)
+ *   3. Per-user / per-session throttling — DynamoDB conditional writes
+ *   4. OAuth inbound at the Runtime  — AgentCore Identity (Cognito JWT)
+ *   5. Network perimeter             — VPC endpoint policy + Runtime
+ *                                      resource-based policy with aws:SourceVpc
+ *   6. Prompt-layer protection       — Amazon Bedrock Guardrails
+ *   7. Observability                 — CloudWatch logs + INVALID_JWT alarm
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -35,6 +47,7 @@ import { Construct } from 'constructs';
 import * as path from 'path';
 
 export interface AgentCoreSecurityStackProps extends cdk.StackProps {
+  /** Override the VPC CIDR (default: 10.0.0.0/16). */
   vpcCidr?: string;
 }
 
@@ -45,7 +58,155 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     const vpcCidr = props?.vpcCidr ?? '10.0.0.0/16';
 
     // =====================================================================
-    // NETWORKING
+    // AUTHENTICATION (Cognito) — used both by the API Gateway Lambda
+    // Authorizer and by the AgentCore Runtime's inbound JWT authorizer.
+    // =====================================================================
+
+    const userPool = new cognito.UserPool(this, 'UserPool', {
+      userPoolName: 'agentcore-security-users',
+      selfSignUpEnabled: false,
+      signInAliases: { email: true },
+      autoVerify: { email: true },
+      passwordPolicy: {
+        minLength: 8,
+        requireLowercase: true,
+        requireUppercase: true,
+        requireDigits: true,
+        requireSymbols: true,
+      },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
+      userPool,
+      userPoolClientName: 'agentcore-security-client',
+      authFlows: { userPassword: true, userSrp: true },
+      generateSecret: false,
+    });
+
+    // =====================================================================
+    // THROTTLE TABLE — partition key `pk` with synthetic prefixed keys:
+    //   - `USER#<sub>`                       — active session count per user
+    //   - `INVOCATIONS#<compositeSessionId>` — invocation count per session
+    // Session binding is enforced by the composite hash itself; this table
+    // is throttling-only.
+    // =====================================================================
+
+    const throttleTable = new dynamodb.Table(this, 'ThrottleTable', {
+      tableName: `agentcore-throttle-${cdk.Names.uniqueId(this).slice(-8)}`,
+      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'expiresAt',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // =====================================================================
+    // LAMBDA AUTHORIZER — JWT validation, composite session hashing,
+    // throttling. Runs outside the VPC so it can reach Cognito JWKS and
+    // DynamoDB over the public service endpoints.
+    // =====================================================================
+
+    const authorizerLogGroup = new logs.LogGroup(this, 'AuthorizerLogGroup', {
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const authorizerFn = new lambdaNodejs.NodejsFunction(this, 'AuthorizerFn', {
+      entry: path.join(__dirname, '..', 'lambda', 'authorizer', 'index.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 256,
+      logGroup: authorizerLogGroup,
+      environment: {
+        THROTTLE_TABLE_NAME: throttleTable.tableName,
+        COGNITO_ISSUER: `https://cognito-idp.${this.region}.amazonaws.com/${userPool.userPoolId}`,
+        MAX_SESSIONS_PER_USER: '5',
+        MAX_INVOCATIONS_PER_SESSION: '100',
+        SESSION_TTL_HOURS: '24',
+      },
+      bundling: { minify: true, sourceMap: true },
+    });
+
+    throttleTable.grantReadWriteData(authorizerFn);
+
+    // =====================================================================
+    // BEDROCK GUARDRAIL — prompt-injection detection + PII protection,
+    // applied by AgentCore Runtime on every model invocation.
+    // =====================================================================
+
+    const guardrail = new bedrock.CfnGuardrail(this, 'AgentGuardrail', {
+      name: `agentcore-security-guardrail-${cdk.Names.uniqueId(this).slice(-8)}`,
+      description: 'Prompt injection detection and PII protection for the AgentCore security sample',
+      blockedInputMessaging: 'Your request was blocked by our safety controls.',
+      blockedOutputsMessaging: 'The response was blocked by our safety controls.',
+      contentPolicyConfig: {
+        filtersConfig: [
+          { type: 'PROMPT_ATTACK', inputStrength: 'HIGH', outputStrength: 'NONE' },
+        ],
+      },
+      sensitiveInformationPolicyConfig: {
+        piiEntitiesConfig: [
+          { type: 'EMAIL', action: 'ANONYMIZE' },
+          { type: 'PHONE', action: 'ANONYMIZE' },
+          { type: 'US_SOCIAL_SECURITY_NUMBER', action: 'BLOCK' },
+          { type: 'CREDIT_DEBIT_CARD_NUMBER', action: 'BLOCK' },
+        ],
+      },
+    });
+
+    const guardrailVersion = new bedrock.CfnGuardrailVersion(this, 'AgentGuardrailVersion', {
+      guardrailIdentifier: guardrail.attrGuardrailId,
+      description: 'Initial version',
+    });
+
+    // =====================================================================
+    // AGENTCORE RUNTIME — OAuth inbound (Cognito) so the user's JWT is
+    // validated by AgentCore Identity directly. No SigV4 swap needed.
+    // =====================================================================
+
+    const agentRuntime = new agentcore.Runtime(this, 'AgentCoreRuntime', {
+      runtimeName: 'securitySampleAgent',
+      description: 'Strands agent for the security reference architecture',
+      authorizerConfiguration: agentcore.RuntimeAuthorizerConfiguration.usingCognito(
+        userPool,
+        [userPoolClient],
+      ),
+      agentRuntimeArtifact: agentcore.AgentRuntimeArtifact.fromCodeAsset({
+        path: path.join(__dirname, '..', '.build', 'agent'),
+        runtime: agentcore.AgentCoreRuntime.PYTHON_3_12,
+        entrypoint: ['handler.py'],
+      }),
+      environmentVariables: {
+        MODEL_ID: 'global.amazon.nova-2-lite-v1:0',
+        GUARDRAIL_ID: guardrail.attrGuardrailId,
+        GUARDRAIL_VERSION: guardrailVersion.attrVersion,
+      },
+    });
+
+    // Grant the runtime's execution role permission to invoke the Bedrock model.
+    // Strands Agents uses the Converse API (ConverseStream).
+    agentRuntime.addToRolePolicy(new iam.PolicyStatement({
+      actions: [
+        'bedrock:InvokeModel',
+        'bedrock:InvokeModelWithResponseStream',
+        'bedrock:Converse',
+        'bedrock:ConverseStream',
+      ],
+      resources: [
+        `arn:aws:bedrock:${this.region}::foundation-model/amazon.nova-2-lite-v1:0`,
+        `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/global.amazon.nova-2-lite-v1:0`,
+        `arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0`,
+      ],
+    }));
+
+    agentRuntime.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['bedrock:ApplyGuardrail'],
+      resources: [guardrail.attrGuardrailArn],
+    }));
+
+    // =====================================================================
+    // NETWORKING — private subnets, no IGW, no NAT
     // =====================================================================
 
     const vpc = new ec2.Vpc(this, 'SecurityVpc', {
@@ -70,13 +231,13 @@ export class AgentCoreSecurityStack extends cdk.Stack {
 
     const lambdaSg = new ec2.SecurityGroup(this, 'LambdaSg', {
       vpc,
-      description: 'Security group for proxy Lambda - allows outbound to VPC endpoints on 443',
+      description: 'Security group for Proxy Lambda — outbound to VPC endpoints on 443',
       allowAllOutbound: false,
     });
 
     const vpcEndpointSg = new ec2.SecurityGroup(this, 'VpcEndpointSg', {
       vpc,
-      description: 'Security group for VPC endpoints - allows inbound from Lambda SG on 443',
+      description: 'Security group for VPC endpoints — inbound from Lambda SG on 443',
       allowAllOutbound: false,
     });
 
@@ -106,138 +267,9 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     });
 
     // =====================================================================
-    // AUTHENTICATION & THROTTLING
-    // =====================================================================
-
-    const userPool = new cognito.UserPool(this, 'UserPool', {
-      userPoolName: 'agentcore-security-users',
-      selfSignUpEnabled: false,
-      signInAliases: { email: true },
-      autoVerify: { email: true },
-      passwordPolicy: { minLength: 8, requireLowercase: true, requireUppercase: true, requireDigits: true, requireSymbols: true },
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
-
-    const userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
-      userPool,
-      userPoolClientName: 'agentcore-security-client',
-      authFlows: { userPassword: true, userSrp: true },
-      generateSecret: false,
-    });
-
-    // Throttle-only table. Partition key `pk` stores synthetic prefixed keys:
-    //   - `USER#<sub>`                       — active session count per user
-    //   - `INVOCATIONS#<compositeSessionId>` — invocation count per session
-    // Session binding is no longer tracked here — the composite session ID
-    // (sha256(uuid:jwtSub)) makes cross-user collisions impossible.
-    const throttleTable = new dynamodb.Table(this, 'ThrottleTable', {
-      tableName: `agentcore-throttle-${cdk.Names.uniqueId(this).slice(-8)}`,
-      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      timeToLiveAttribute: 'expiresAt',
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
-
-    const authorizerLogGroup = new logs.LogGroup(this, 'AuthorizerLogGroup', {
-      retention: logs.RetentionDays.ONE_WEEK,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
-
-    const authorizerFn = new lambdaNodejs.NodejsFunction(this, 'AuthorizerFn', {
-      entry: path.join(__dirname, '..', 'lambda', 'authorizer', 'index.ts'),
-      handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_22_X,
-      timeout: cdk.Duration.seconds(10),
-      memorySize: 256,
-      logGroup: authorizerLogGroup,
-      environment: {
-        THROTTLE_TABLE_NAME: throttleTable.tableName,
-        COGNITO_ISSUER: `https://cognito-idp.${this.region}.amazonaws.com/${userPool.userPoolId}`,
-        MAX_SESSIONS_PER_USER: '5',
-        MAX_INVOCATIONS_PER_SESSION: '100',
-        SESSION_TTL_HOURS: '24',
-      },
-      bundling: { minify: true, sourceMap: true },
-    });
-
-    throttleTable.grantReadWriteData(authorizerFn);
-
-    // =====================================================================
-    // BEDROCK GUARDRAIL — prompt injection + PII protection
-    // =====================================================================
-
-    const guardrail = new bedrock.CfnGuardrail(this, 'AgentGuardrail', {
-      name: `agentcore-security-guardrail-${cdk.Names.uniqueId(this).slice(-8)}`,
-      description: 'Prompt injection detection and PII protection for the AgentCore security sample',
-      blockedInputMessaging: 'Your request was blocked by our safety controls.',
-      blockedOutputsMessaging: 'The response was blocked by our safety controls.',
-      contentPolicyConfig: {
-        filtersConfig: [
-          { type: 'PROMPT_ATTACK', inputStrength: 'HIGH', outputStrength: 'NONE' },
-        ],
-      },
-      sensitiveInformationPolicyConfig: {
-        piiEntitiesConfig: [
-          { type: 'EMAIL', action: 'ANONYMIZE' },
-          { type: 'PHONE', action: 'ANONYMIZE' },
-          { type: 'US_SOCIAL_SECURITY_NUMBER', action: 'BLOCK' },
-          { type: 'CREDIT_DEBIT_CARD_NUMBER', action: 'BLOCK' },
-        ],
-      },
-    });
-
-    const guardrailVersion = new bedrock.CfnGuardrailVersion(this, 'AgentGuardrailVersion', {
-      guardrailIdentifier: guardrail.attrGuardrailId,
-      description: 'Initial version',
-    });
-
-    // =====================================================================
-    // AGENTCORE RUNTIME
-    // =====================================================================
-
-    // deploy.sh builds .build/agent/ with Linux ARM64 dependencies (via uv)
-    // and copies handler.py into it. fromCodeAsset uploads the directory as-is.
-    const agentRuntime = new agentcore.Runtime(this, 'AgentCoreRuntime', {
-      runtimeName: 'securitySampleAgent',
-      description: 'Strands agent for the security reference architecture sample',
-      agentRuntimeArtifact: agentcore.AgentRuntimeArtifact.fromCodeAsset({
-        path: path.join(__dirname, '..', '.build', 'agent'),
-        runtime: agentcore.AgentCoreRuntime.PYTHON_3_12,
-        entrypoint: ['handler.py'],
-      }),
-      environmentVariables: {
-        MODEL_ID: 'global.amazon.nova-2-lite-v1:0',
-        GUARDRAIL_ID: guardrail.attrGuardrailId,
-        GUARDRAIL_VERSION: guardrailVersion.attrVersion,
-      },
-    });
-
-    // Grant the runtime's execution role permission to invoke the Bedrock model.
-    // Strands Agents uses the Converse API (ConverseStream), so we need both
-    // Converse and InvokeModel actions.
-    agentRuntime.addToRolePolicy(new iam.PolicyStatement({
-      actions: [
-        'bedrock:InvokeModel',
-        'bedrock:InvokeModelWithResponseStream',
-        'bedrock:Converse',
-        'bedrock:ConverseStream',
-      ],
-      resources: [
-        `arn:aws:bedrock:${this.region}::foundation-model/amazon.nova-2-lite-v1:0`,
-        `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/global.amazon.nova-2-lite-v1:0`,
-        `arn:aws:bedrock:*::foundation-model/amazon.nova-2-lite-v1:0`,
-      ],
-    }));
-
-    agentRuntime.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['bedrock:ApplyGuardrail'],
-      resources: [guardrail.attrGuardrailArn],
-    }));
-
-    // AgentCore auto-creates a DEFAULT endpoint. No explicit addEndpoint() needed.
-
-    // =====================================================================
-    // THIN PROXY LAMBDA — only forwards to AgentCore Runtime, no session checks
+    // PROXY LAMBDA — JWT pass-through (no SigV4). Runs in private subnets
+    // so the call to AgentCore exits through the VPC endpoint, populating
+    // aws:SourceVpc and aws:SourceVpce in the request context.
     // =====================================================================
 
     const proxyFn = new lambdaNodejs.NodejsFunction(this, 'ProxyFn', {
@@ -255,10 +287,133 @@ export class AgentCoreSecurityStack extends cdk.Stack {
       bundling: { minify: true, sourceMap: true },
     });
 
-    agentRuntime.grantInvoke(proxyFn);
+    // =====================================================================
+    // VPC ENDPOINT POLICY — only the Proxy Lambda's role can use the
+    // bedrock-agentcore VPCe. Defense in depth alongside the Runtime
+    // resource-based policy below.
+    // =====================================================================
+
+    bedrockEndpoint.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      principals: [new iam.ArnPrincipal(proxyFn.role!.roleArn)],
+      actions: ['bedrock-agentcore:*'],
+      resources: ['*'],
+    }));
+
+    bedrockEndpoint.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.DENY,
+      principals: [new iam.AnyPrincipal()],
+      actions: ['*'],
+      resources: ['*'],
+      conditions: { StringNotEquals: { 'aws:PrincipalArn': proxyFn.role!.roleArn } },
+    }));
 
     // =====================================================================
-    // REST API GATEWAY
+    // RESOURCE-BASED POLICY ON AGENTCORE RUNTIME (via AwsCustomResource).
+    //
+    // OAuth-inbound pattern from the AgentCore docs: wildcard principal
+    // (AgentCore Identity validates the JWT before policy evaluation),
+    // gated by aws:SourceVpc so requests must enter through this stack's
+    // VPC. AgentCore evaluates the policy at both the Runtime ARN and
+    // its DEFAULT endpoint, so the policy is attached to both.
+    // =====================================================================
+
+    const runtimeEndpointArn = `${agentRuntime.agentRuntimeArn}/runtime-endpoint/DEFAULT`;
+
+    const buildOAuthVpcPolicy = (resourceArn: string): string => JSON.stringify({
+      Version: '2012-10-17',
+      Statement: [{
+        Sid: 'AllowOAuthFromVpc',
+        Effect: 'Allow',
+        Principal: '*',
+        Action: 'bedrock-agentcore:InvokeAgentRuntime',
+        Resource: resourceArn,
+        Condition: {
+          StringEquals: { 'aws:SourceVpc': vpc.vpcId },
+        },
+      }],
+    });
+
+    const runtimePolicyCr = new AwsCustomResource(this, 'RuntimeResourcePolicy', {
+      onCreate: {
+        service: 'bedrock-agentcore-control',
+        action: 'PutResourcePolicy',
+        parameters: {
+          resourceArn: agentRuntime.agentRuntimeArn,
+          policy: buildOAuthVpcPolicy(agentRuntime.agentRuntimeArn),
+        },
+        physicalResourceId: PhysicalResourceId.of(`${agentRuntime.agentRuntimeArn}#policy`),
+      },
+      onUpdate: {
+        service: 'bedrock-agentcore-control',
+        action: 'PutResourcePolicy',
+        parameters: {
+          resourceArn: agentRuntime.agentRuntimeArn,
+          policy: buildOAuthVpcPolicy(agentRuntime.agentRuntimeArn),
+        },
+        physicalResourceId: PhysicalResourceId.of(`${agentRuntime.agentRuntimeArn}#policy`),
+      },
+      onDelete: {
+        service: 'bedrock-agentcore-control',
+        action: 'DeleteResourcePolicy',
+        parameters: { resourceArn: agentRuntime.agentRuntimeArn },
+        ignoreErrorCodesMatching: 'ResourceNotFoundException',
+      },
+      policy: AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions: [
+            'bedrock-agentcore:PutResourcePolicy',
+            'bedrock-agentcore:DeleteResourcePolicy',
+          ],
+          resources: [agentRuntime.agentRuntimeArn, runtimeEndpointArn],
+        }),
+      ]),
+      installLatestAwsSdk: true,
+    });
+
+    const endpointPolicyCr = new AwsCustomResource(this, 'RuntimeEndpointResourcePolicy', {
+      onCreate: {
+        service: 'bedrock-agentcore-control',
+        action: 'PutResourcePolicy',
+        parameters: {
+          resourceArn: runtimeEndpointArn,
+          policy: buildOAuthVpcPolicy(runtimeEndpointArn),
+        },
+        physicalResourceId: PhysicalResourceId.of(`${runtimeEndpointArn}#policy`),
+      },
+      onUpdate: {
+        service: 'bedrock-agentcore-control',
+        action: 'PutResourcePolicy',
+        parameters: {
+          resourceArn: runtimeEndpointArn,
+          policy: buildOAuthVpcPolicy(runtimeEndpointArn),
+        },
+        physicalResourceId: PhysicalResourceId.of(`${runtimeEndpointArn}#policy`),
+      },
+      onDelete: {
+        service: 'bedrock-agentcore-control',
+        action: 'DeleteResourcePolicy',
+        parameters: { resourceArn: runtimeEndpointArn },
+        ignoreErrorCodesMatching: 'ResourceNotFoundException',
+      },
+      policy: AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions: [
+            'bedrock-agentcore:PutResourcePolicy',
+            'bedrock-agentcore:DeleteResourcePolicy',
+          ],
+          resources: [agentRuntime.agentRuntimeArn, runtimeEndpointArn],
+        }),
+      ]),
+      installLatestAwsSdk: true,
+    });
+
+    runtimePolicyCr.node.addDependency(agentRuntime);
+    endpointPolicyCr.node.addDependency(agentRuntime);
+
+    // =====================================================================
+    // REST API GATEWAY — Lambda integration to the Proxy Lambda (in VPC),
+    // with response streaming for token-by-token UX.
     // =====================================================================
 
     const apiLogGroup = new logs.LogGroup(this, 'ApiAccessLogGroup', {
@@ -287,13 +442,22 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     });
 
     const invokeResource = api.root.addResource('invoke');
-    invokeResource.addMethod('POST', new apigateway.LambdaIntegration(proxyFn), {
-      authorizer,
-      authorizationType: apigateway.AuthorizationType.CUSTOM,
-    });
+
+    invokeResource.addMethod('POST',
+      new apigateway.LambdaIntegration(proxyFn),
+      {
+        authorizer,
+        authorizationType: apigateway.AuthorizationType.CUSTOM,
+        requestParameters: {
+          'method.request.header.Authorization': true,
+          'method.request.header.X-Session-Id': true,
+        },
+      },
+    );
 
     // Enable response streaming — override the L1 integration to use the
-    // Lambda response-streaming invocation endpoint and STREAM transfer mode.
+    // Lambda response-streaming invocation endpoint and STREAM transfer
+    // mode. CDK's L2 doesn't expose this yet.
     const cfnMethod = invokeResource.node.findChild('POST').node.defaultChild as apigateway.CfnMethod;
     cfnMethod.addPropertyOverride('Integration.Uri',
       `arn:aws:apigateway:${this.region}:lambda:path/2021-11-15/functions/${proxyFn.functionArn}/response-streaming-invocations`,
@@ -308,7 +472,6 @@ export class AgentCoreSecurityStack extends cdk.Stack {
       'DeploymentId', deployment.node.defaultChild && (deployment.node.defaultChild as cdk.CfnResource).ref,
     );
 
-    // API Gateway needs permission to call the Lambda streaming endpoint.
     proxyFn.addPermission('ApiGwStreamingInvoke', {
       principal: new iam.ServicePrincipal('apigateway.amazonaws.com'),
       action: 'lambda:InvokeFunctionUrl',
@@ -316,140 +479,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     });
 
     // =====================================================================
-    // VPC ENDPOINT POLICIES — restrict AgentCore access to proxy Lambda role only
-    // =====================================================================
-
-    bedrockEndpoint.addToPolicy(new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      principals: [new iam.ArnPrincipal(proxyFn.role!.roleArn)],
-      actions: ['bedrock-agentcore:*'],
-      resources: ['*'],
-    }));
-
-    bedrockEndpoint.addToPolicy(new iam.PolicyStatement({
-      effect: iam.Effect.DENY,
-      principals: [new iam.AnyPrincipal()],
-      actions: ['*'],
-      resources: ['*'],
-      conditions: { StringNotEquals: { 'aws:PrincipalArn': proxyFn.role!.roleArn } },
-    }));
-
-    // =====================================================================
-    // RESOURCE-BASED POLICY ON AGENTCORE RUNTIME (via custom resource)
-    //
-    // The alpha Runtime construct does not yet expose a resource-policy
-    // property, so we use AwsCustomResource to call PutResourcePolicy on both
-    // the runtime ARN and its DEFAULT endpoint ARN — AgentCore evaluates
-    // authorization at both layers, so both must carry the policy.
-    //
-    // Deny-only guardrail: same-account calls are already granted via the
-    // proxy Lambda's identity policy (grantInvoke above). All we need here is
-    // to reject any invocation that did not arrive through this stack's
-    // bedrock-agentcore VPC endpoint, regardless of who the caller is.
-    // =====================================================================
-
-    // Endpoint ARN pattern: arn:…:runtime/<RuntimeId>/runtime-endpoint/<Name>
-    // (from the AWS Service Authorization Reference — "runtime-endpoint", not "endpoint")
-    const runtimeEndpointArn = `${agentRuntime.agentRuntimeArn}/runtime-endpoint/DEFAULT`;
-
-    const buildRuntimePolicy = (resourceArn: string): string => JSON.stringify({
-      Version: '2012-10-17',
-      Statement: [
-        {
-          Sid: 'DenyUnlessViaVpce',
-          Effect: 'Deny',
-          Principal: '*',
-          Action: 'bedrock-agentcore:*',
-          Resource: resourceArn,
-          Condition: {
-            StringNotEquals: { 'aws:SourceVpce': bedrockEndpoint.vpcEndpointId },
-            Bool: { 'aws:ViaAWSService': 'false' },
-          },
-        },
-      ],
-    });
-
-    const runtimePolicyCr = new AwsCustomResource(this, 'RuntimeResourcePolicy', {
-      onCreate: {
-        service: 'bedrock-agentcore-control',
-        action: 'PutResourcePolicy',
-        parameters: {
-          resourceArn: agentRuntime.agentRuntimeArn,
-          policy: buildRuntimePolicy(agentRuntime.agentRuntimeArn),
-        },
-        physicalResourceId: PhysicalResourceId.of(`${agentRuntime.agentRuntimeArn}#policy`),
-      },
-      onUpdate: {
-        service: 'bedrock-agentcore-control',
-        action: 'PutResourcePolicy',
-        parameters: {
-          resourceArn: agentRuntime.agentRuntimeArn,
-          policy: buildRuntimePolicy(agentRuntime.agentRuntimeArn),
-        },
-        physicalResourceId: PhysicalResourceId.of(`${agentRuntime.agentRuntimeArn}#policy`),
-      },
-      onDelete: {
-        service: 'bedrock-agentcore-control',
-        action: 'DeleteResourcePolicy',
-        parameters: { resourceArn: agentRuntime.agentRuntimeArn },
-        ignoreErrorCodesMatching: 'ResourceNotFoundException',
-      },
-      policy: AwsCustomResourcePolicy.fromStatements([
-        new iam.PolicyStatement({
-          actions: [
-            'bedrock-agentcore:PutResourcePolicy',
-            'bedrock-agentcore:DeleteResourcePolicy',
-          ],
-          resources: [agentRuntime.agentRuntimeArn, runtimeEndpointArn],
-        }),
-      ]),
-      installLatestAwsSdk: true,
-    });
-
-    const endpointPolicyCr = new AwsCustomResource(this, 'RuntimeEndpointResourcePolicy', {
-      onCreate: {
-        service: 'bedrock-agentcore-control',
-        action: 'PutResourcePolicy',
-        parameters: {
-          resourceArn: runtimeEndpointArn,
-          policy: buildRuntimePolicy(runtimeEndpointArn),
-        },
-        physicalResourceId: PhysicalResourceId.of(`${runtimeEndpointArn}#policy`),
-      },
-      onUpdate: {
-        service: 'bedrock-agentcore-control',
-        action: 'PutResourcePolicy',
-        parameters: {
-          resourceArn: runtimeEndpointArn,
-          policy: buildRuntimePolicy(runtimeEndpointArn),
-        },
-        physicalResourceId: PhysicalResourceId.of(`${runtimeEndpointArn}#policy`),
-      },
-      onDelete: {
-        service: 'bedrock-agentcore-control',
-        action: 'DeleteResourcePolicy',
-        parameters: { resourceArn: runtimeEndpointArn },
-        ignoreErrorCodesMatching: 'ResourceNotFoundException',
-      },
-      policy: AwsCustomResourcePolicy.fromStatements([
-        new iam.PolicyStatement({
-          actions: [
-            'bedrock-agentcore:PutResourcePolicy',
-            'bedrock-agentcore:DeleteResourcePolicy',
-          ],
-          resources: [agentRuntime.agentRuntimeArn, runtimeEndpointArn],
-        }),
-      ]),
-      installLatestAwsSdk: true,
-    });
-
-    // Guarantee the Runtime (and its auto-created DEFAULT endpoint) exist
-    // before the policies are applied.
-    runtimePolicyCr.node.addDependency(agentRuntime);
-    endpointPolicyCr.node.addDependency(agentRuntime);
-
-    // =====================================================================
-    // MONITORING
+    // MONITORING — INVALID_JWT metric filter + alarm
     // =====================================================================
 
     const invalidJwtFilter = new logs.MetricFilter(this, 'InvalidJwtFilter', {
@@ -474,10 +504,6 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     // CDK-NAG SUPPRESSIONS — justified exceptions for sample code
     // =====================================================================
 
-    NagSuppressions.addResourceSuppressions(vpcEndpointSg, [
-      { id: 'CdkNagValidationFailure', reason: 'EC23 cannot resolve VPC CIDR intrinsic — security group only allows inbound from Lambda SG on 443' },
-    ]);
-
     NagSuppressions.addResourceSuppressions(userPool, [
       { id: 'AwsSolutions-COG2', reason: 'MFA not required for sample test users — admin-created only, selfSignUpEnabled: false' },
       { id: 'AwsSolutions-COG8', reason: 'Cognito Plus tier adds cost — not needed for a sample/demo' },
@@ -488,7 +514,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     ]);
 
     NagSuppressions.addResourceSuppressions(api, [
-      { id: 'AwsSolutions-APIG2', reason: 'Request validation handled by Lambda Authorizer (JWT, UUID v4 format) and proxy Lambda (JSON body)' },
+      { id: 'AwsSolutions-APIG2', reason: 'Request validation handled by Lambda Authorizer (JWT, UUID v4 format) and AgentCore Identity (JWT)' },
     ]);
 
     NagSuppressions.addResourceSuppressions(api, [
@@ -499,40 +525,62 @@ export class AgentCoreSecurityStack extends cdk.Stack {
       { id: 'AwsSolutions-COG4', reason: 'Uses custom Lambda Authorizer by design — JWT validation + composite session hashing + throttling, not a Cognito authorizer' },
     ], true);
 
-    NagSuppressions.addResourceSuppressions([authorizerFn, proxyFn], [
-      { id: 'AwsSolutions-L1', reason: 'Using NODEJS_22_X — cdk-nag 2.38.1 has not yet added it to the latest-runtime allowlist' },
-      { id: 'AwsSolutions-IAM4', reason: 'AWS managed policies (AWSLambdaBasicExecutionRole, AWSLambdaVPCAccessExecutionRole) are standard for Lambda functions', appliesTo: [
-        'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
-        'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole',
-      ] },
+    const lambdasForNag: lambdaNodejs.NodejsFunction[] = [authorizerFn, proxyFn];
+    NagSuppressions.addResourceSuppressions(lambdasForNag, [
+      { id: 'AwsSolutions-L1', reason: 'Using NODEJS_22_X — cdk-nag has not yet added it to the latest-runtime allowlist' },
+      {
+        id: 'AwsSolutions-IAM4',
+        reason: 'AWS managed policies (AWSLambdaBasicExecutionRole, AWSLambdaVPCAccessExecutionRole) are standard for Lambda functions',
+        appliesTo: [
+          'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
+          'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole',
+        ],
+      },
     ], true);
 
     NagSuppressions.addResourceSuppressions(api, [
-      { id: 'AwsSolutions-IAM4', reason: 'AWS managed policy for API Gateway CloudWatch logging is standard', appliesTo: [
-        'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs',
-      ] },
+      {
+        id: 'AwsSolutions-IAM4',
+        reason: 'AWS managed policy for API Gateway CloudWatch logging is standard',
+        appliesTo: ['Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs'],
+      },
     ], true);
 
     NagSuppressions.addResourceSuppressions(agentRuntime, [
-      { id: 'AwsSolutions-IAM5', reason: 'Wildcards in AgentCore Runtime execution role are generated by the alpha CDK construct — not user-controlled. Log group wildcards required for runtime logging.' },
+      {
+        id: 'AwsSolutions-IAM5',
+        reason: 'Wildcards in AgentCore Runtime execution role are generated by the alpha CDK construct — not user-controlled. Log group wildcards required for runtime logging.',
+      },
     ], true);
 
+    // VPC endpoint security group cannot resolve VPC CIDR intrinsic in cdk-nag.
+    const vpcEndpointSgConstruct = this.node.findChild('VpcEndpointSg') as Construct;
+    NagSuppressions.addResourceSuppressions(vpcEndpointSgConstruct, [
+      { id: 'CdkNagValidationFailure', reason: 'EC23 cannot resolve VPC CIDR intrinsic — security group only allows inbound from Lambda SG on 443' },
+    ]);
+
     NagSuppressions.addResourceSuppressions(proxyFn, [
-      { id: 'AwsSolutions-IAM5', reason: 'Runtime ARN/* wildcard required to invoke AgentCore Runtime endpoints (DEFAULT endpoint)', appliesTo: [
-        { regex: '/^Resource::.*AgentRuntimeArn.*\\*$/g' },
-      ] },
+      {
+        id: 'AwsSolutions-IAM5',
+        reason: 'Runtime ARN/* wildcard required to invoke AgentCore Runtime endpoints (DEFAULT endpoint)',
+        appliesTo: [{ regex: '/^Resource::.*AgentRuntimeArn.*\\*$/g' }],
+      },
     ], true);
 
     // AwsCustomResource instantiates a shared singleton Lambda at the stack
-    // root (construct ID 'AWS679f53fac002430cb0da5b7982bd2287'). Suppress on
-    // the construct node directly so it works regardless of the stack ID.
-    const crSingleton = this.node.findChild('AWS679f53fac002430cb0da5b7982bd2287') as Construct;
-    NagSuppressions.addResourceSuppressions(crSingleton, [
-      { id: 'AwsSolutions-L1', reason: 'AwsCustomResource provisions its own Lambda — runtime controlled by CDK, not user-configurable' },
-      { id: 'AwsSolutions-IAM4', reason: 'AwsCustomResource uses the AWS-managed AWSLambdaBasicExecutionRole by design', appliesTo: [
-        'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
-      ] },
-    ], true);
+    // root. Suppress on the construct node directly so it works regardless
+    // of stack ID.
+    const crSingleton = this.node.findChild('AWS679f53fac002430cb0da5b7982bd2287') as Construct | undefined;
+    if (crSingleton) {
+      NagSuppressions.addResourceSuppressions(crSingleton, [
+        { id: 'AwsSolutions-L1', reason: 'AwsCustomResource provisions its own Lambda — runtime controlled by CDK, not user-configurable' },
+        {
+          id: 'AwsSolutions-IAM4',
+          reason: 'AwsCustomResource uses the AWS-managed AWSLambdaBasicExecutionRole by design',
+          appliesTo: ['Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'],
+        },
+      ], true);
+    }
 
     // =====================================================================
     // STACK OUTPUTS
@@ -543,8 +591,9 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'UserPoolClientId', { value: userPoolClient.userPoolClientId, description: 'Cognito User Pool Client ID' });
     new cdk.CfnOutput(this, 'ThrottleTableName', { value: throttleTable.tableName, description: 'DynamoDB throttle table name' });
     new cdk.CfnOutput(this, 'Region', { value: this.region, description: 'AWS Region' });
-    new cdk.CfnOutput(this, 'VpcId', { value: vpc.vpcId, description: 'VPC ID' });
     new cdk.CfnOutput(this, 'AgentRuntimeArn', { value: agentRuntime.agentRuntimeArn, description: 'AgentCore Runtime ARN' });
+    new cdk.CfnOutput(this, 'AgentRuntimeId', { value: agentRuntime.agentRuntimeId, description: 'AgentCore Runtime ID' });
     new cdk.CfnOutput(this, 'GuardrailId', { value: guardrail.attrGuardrailId, description: 'Bedrock Guardrail ID' });
+    new cdk.CfnOutput(this, 'VpcId', { value: vpc.vpcId, description: 'VPC ID' });
   }
 }
