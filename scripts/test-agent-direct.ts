@@ -2,8 +2,8 @@
 /**
  * Direct AgentCore Runtime invocation test (JWT, from outside the VPC).
  *
- * Authenticates against Cognito to obtain a valid id_token, then calls the
- * AgentCore Runtime data plane directly over the public internet with
+ * Authenticates against Cognito to obtain a valid access token, then calls
+ * the AgentCore Runtime data plane directly over the public internet with
  *   `Authorization: Bearer <JWT>`.
  *
  * Expected outcome: the Runtime resource-based policy rejects the call with
@@ -91,11 +91,11 @@ async function getJwt(): Promise<string> {
     AuthFlow: 'USER_PASSWORD_AUTH',
     AuthParameters: { USERNAME, PASSWORD },
   }));
-  const idToken = result.AuthenticationResult?.IdToken;
-  if (!idToken) {
-    throw new Error('No IdToken in Cognito response');
+  const accessToken = result.AuthenticationResult?.AccessToken;
+  if (!accessToken) {
+    throw new Error('No AccessToken in Cognito response');
   }
-  return idToken;
+  return accessToken;
 }
 
 function buildRuntimeUrl(runtimeArn: string, region: string): string {
@@ -137,7 +137,7 @@ async function main(): Promise<void> {
     console.error('Failed to obtain JWT:', err instanceof Error ? err.message : err);
     process.exit(1);
   }
-  console.log('  Got id_token (truncated):', jwt.slice(0, 20) + '...\n');
+  console.log('  Got access_token (truncated):', jwt.slice(0, 20) + '...\n');
 
   console.log('Invoking AgentCore Runtime directly with the JWT (no VPC endpoint)...');
   const startTime = Date.now();

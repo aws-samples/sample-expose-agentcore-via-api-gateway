@@ -125,20 +125,18 @@ describe('Architecture: API Gateway → Proxy Lambda (in VPC) → AgentCore Runt
     expect(endpointPolicy).toBeDefined();
   });
 
-  test('VPC endpoint policy on bedrock-agentcore VPCe restricts to Proxy Lambda role', () => {
+  test('VPC endpoint policy on bedrock-agentcore VPCe explicitly allows InvokeAgentRuntime from any caller in the VPC', () => {
     template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
       ServiceName: Match.stringLikeRegexp('bedrock-agentcore'),
       PolicyDocument: Match.objectLike({
         Statement: Match.arrayWith([
           Match.objectLike({
             Effect: 'Allow',
-            Action: 'bedrock-agentcore:*',
-          }),
-          Match.objectLike({
-            Effect: 'Deny',
-            Condition: Match.objectLike({
-              StringNotEquals: Match.objectLike({ 'aws:PrincipalArn': Match.anyValue() }),
-            }),
+            // Bare "*" — required for OAuth-anonymous callers per the
+            // AgentCore docs. AnyPrincipal produces { AWS: "*" } which
+            // does not match anonymous calls.
+            Principal: '*',
+            Action: 'bedrock-agentcore:InvokeAgentRuntime',
           }),
         ]),
       }),

@@ -67,7 +67,7 @@ get_jwt() {
     --client-id "${USER_POOL_CLIENT_ID}" \
     --auth-flow USER_PASSWORD_AUTH \
     --auth-parameters "USERNAME=${1},PASSWORD=${2}" \
-    --query 'AuthenticationResult.IdToken' \
+    --query 'AuthenticationResult.AccessToken' \
     --output text
 }
 

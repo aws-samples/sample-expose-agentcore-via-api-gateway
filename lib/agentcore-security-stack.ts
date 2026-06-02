@@ -288,24 +288,34 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     });
 
     // =====================================================================
-    // VPC ENDPOINT POLICY — only the Proxy Lambda's role can use the
-    // bedrock-agentcore VPCe. Defense in depth alongside the Runtime
-    // resource-based policy below.
+    // VPC ENDPOINT POLICY — explicit allow-all for InvokeAgentRuntime.
+    //
+    // With OAuth-inbound at the runtime, the Proxy Lambda forwards the
+    // user's JWT (no SigV4), so calls reach this VPCe without an IAM
+    // principal — aws:PrincipalArn is empty. An IAM-based policy that
+    // distinguishes callers by aws:PrincipalArn cannot work in this mode
+    // (any caller without a principal would be denied, including ours).
+    //
+    // We therefore document the intent explicitly: this VPCe is for the
+    // bedrock-agentcore data-plane action InvokeAgentRuntime, accepted
+    // from any caller inside this VPC. This is functionally equivalent
+    // to the default VPCe policy (allow all), but makes the architecture
+    // explicit in IaC.
+    //
+    // The actual perimeter is enforced one hop downstream by the Runtime
+    // resource-based policy (AllowOAuthFromVpc with aws:SourceVpc), and
+    // network-level by the VPCe security group (only the Proxy Lambda's
+    // SG can ingress on 443).
     // =====================================================================
 
     bedrockEndpoint.addToPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
-      principals: [new iam.ArnPrincipal(proxyFn.role!.roleArn)],
-      actions: ['bedrock-agentcore:*'],
+      // StarPrincipal produces bare "*" (matches anonymous callers) — not
+      // AnyPrincipal which produces { AWS: "*" } (matches IAM principals
+      // only, not OAuth-anonymous calls).
+      principals: [new iam.StarPrincipal()],
+      actions: ['bedrock-agentcore:InvokeAgentRuntime'],
       resources: ['*'],
-    }));
-
-    bedrockEndpoint.addToPolicy(new iam.PolicyStatement({
-      effect: iam.Effect.DENY,
-      principals: [new iam.AnyPrincipal()],
-      actions: ['*'],
-      resources: ['*'],
-      conditions: { StringNotEquals: { 'aws:PrincipalArn': proxyFn.role!.roleArn } },
     }));
 
     // =====================================================================

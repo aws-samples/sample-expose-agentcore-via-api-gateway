@@ -24,7 +24,7 @@ sequenceDiagram
     participant R as AgentCore Runtime
 
     C->>K: InitiateAuth (user + password)
-    K-->>C: JWT id_token
+    K-->>C: JWT access_token
     C->>G: POST /v1/invoke<br/>Authorization: Bearer JWT<br/>X-Session-Id: uuid-v4
     G->>A: Invoke authorizer (REQUEST)
 
@@ -87,7 +87,7 @@ The Proxy Lambda runs in a VPC with private isolated subnets only — no Interne
 
 Two independent controls restrict the AgentCore Runtime to the intended path:
 
-1. **VPC endpoint policy** — the `bedrock-agentcore` VPC endpoint has an IAM policy that allows only the Proxy Lambda's execution role to use the endpoint. An explicit `Deny` blocks every other principal. This controls _who in your VPC can use the endpoint_.
+1. **VPC endpoint policy** — the `bedrock-agentcore` VPC endpoint has an explicit policy allowing `bedrock-agentcore:InvokeAgentRuntime` from any caller inside this VPC. With OAuth-inbound at the runtime, the Proxy Lambda forwards the user's JWT (no SigV4), so calls reach this VPCe with no IAM principal — an IAM-based filter on `aws:PrincipalArn` cannot work in this mode and would block legitimate traffic. Documenting the allow explicitly makes the architectural intent visible in IaC. _Who can actually reach the VPCe_ is enforced at the network layer by the security group (only the Proxy Lambda's SG can ingress on 443).
 2. **Runtime resource-based policy** — applied to both the Runtime and its `DEFAULT` endpoint via a CDK `AwsCustomResource`. With OAuth inbound, the policy follows the [pattern documented for OAuth-authenticated runtimes](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/resource-based-policies.html): `Effect: Allow`, `Principal: "*"`, gated by `aws:SourceVpc` matching this stack's VPC. The wildcard principal is required because OAuth tokens are validated by AgentCore Identity _before_ policy evaluation — only callers with valid JWTs from your registered IdP reach the policy. The `aws:SourceVpc` condition then narrows access to this stack's VPC.
 
 Together these enforce: **valid JWT from your IdP AND request originating from this stack's VPC**. Either gate alone is bypassable; both together provide defense in depth. A JWT-authenticated call from outside the VPC (for example, the rewritten `scripts/test-agent-direct.ts` from a developer laptop) is rejected by the resource-based policy with `AccessDeniedException` — by design, because the laptop's request doesn't traverse your VPC endpoint and therefore doesn't carry `aws:SourceVpc` in its context.
@@ -293,7 +293,7 @@ JWT=$(aws cognito-idp initiate-auth \
   --client-id $USER_POOL_CLIENT_ID \
   --auth-flow USER_PASSWORD_AUTH \
   --auth-parameters "USERNAME=user1@test.com,PASSWORD=${PASSWORD_USER1}" \
-  --query 'AuthenticationResult.IdToken' \
+  --query 'AuthenticationResult.AccessToken' \
   --output text)
 
 # Invoke the agent (any valid UUID v4 works)
@@ -358,7 +358,7 @@ This runs `cdk destroy --force` to remove all provisioned resources.
 
 - **Lambda Authorizer runs outside the VPC**: The Authorizer needs to reach Cognito's JWKS endpoint to validate JWT signatures. Running it outside the VPC avoids the need for a Cognito VPC endpoint. DynamoDB access works via the public service endpoint.
 
-- **Proxy Lambda runs inside the VPC**: Private subnets with no internet egress, so its only path to AgentCore is via the `bedrock-agentcore` VPC endpoint. The VPC endpoint policy restricts that endpoint to the Proxy Lambda's execution role, and the Runtime resource-based policy independently enforces `aws:SourceVpc` on the runtime side.
+- **Proxy Lambda runs inside the VPC**: Private subnets with no internet egress, so its only path to AgentCore is via the `bedrock-agentcore` VPC endpoint. The VPCe security group restricts inbound to the Proxy Lambda's SG on 443 (network-layer restriction), and the Runtime resource-based policy independently enforces `aws:SourceVpc` on the runtime side. The VPCe policy itself is an explicit allow for `InvokeAgentRuntime` — required because OAuth-inbound calls have no IAM principal to filter on.
 
 ## Recommendations
 
@@ -445,7 +445,7 @@ new wafv2.CfnWebACLAssociation(this, "ApiWebAclAssoc", {
 
 ## Resource-based policy on the AgentCore Runtime (shipped in this stack)
 
-The OAuth + VPC perimeter is enforced via a resource-based policy attached to the AgentCore Runtime — this is one of the shipped controls, not a future recommendation. Why it matters: the VPC endpoint policy alone gates _who in your VPC can use the endpoint_, but it doesn't stop a different principal in the account from reaching the runtime via a different network path. The resource-based policy closes that hole at the runtime itself: the runtime independently rejects any request that didn't arrive through this stack's VPC.
+The OAuth + VPC perimeter is enforced via a resource-based policy attached to the AgentCore Runtime — this is one of the shipped controls, not a future recommendation. Why it matters: in OAuth-inbound mode the Proxy Lambda forwards JWTs without SigV4, so the VPC endpoint policy can't restrict by IAM principal — only by intent (allow-all for `InvokeAgentRuntime`). Network-level restriction is handled by the VPCe's security group (only the Proxy Lambda's SG can reach the VPCe). The Runtime resource-based policy is what actually enforces the perimeter on the runtime side: it independently rejects any request that didn't arrive through this stack's VPC, regardless of the network path the caller chose.
 
 This stack **applies the policy automatically** via a CDK `AwsCustomResource` (the alpha `Runtime` construct does not yet expose a resource-policy property). At deploy time, the custom resource calls `bedrock-agentcore-control:PutResourcePolicy` against both the Runtime ARN and its `DEFAULT` endpoint ARN; on stack deletion it calls `DeleteResourcePolicy`. See `lib/agentcore-security-stack.ts` (search for `RuntimeResourcePolicy`).
 
