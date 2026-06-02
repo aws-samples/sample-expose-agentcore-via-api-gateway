@@ -231,13 +231,13 @@ export class AgentCoreSecurityStack extends cdk.Stack {
 
     const lambdaSg = new ec2.SecurityGroup(this, 'LambdaSg', {
       vpc,
-      description: 'Security group for Proxy Lambda — outbound to VPC endpoints on 443',
+      description: 'Security group for Proxy Lambda - outbound to VPC endpoints on 443',
       allowAllOutbound: false,
     });
 
     const vpcEndpointSg = new ec2.SecurityGroup(this, 'VpcEndpointSg', {
       vpc,
-      description: 'Security group for VPC endpoints — inbound from Lambda SG on 443',
+      description: 'Security group for VPC endpoints - inbound from Lambda SG on 443',
       allowAllOutbound: false,
     });
 
