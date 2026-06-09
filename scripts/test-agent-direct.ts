@@ -106,6 +106,19 @@ function buildRuntimeUrl(runtimeArn: string, region: string): string {
   );
 }
 
+function redactUsername(username: string): string {
+  const at = username.indexOf('@');
+  if (at > 0) {
+    const local = username.slice(0, at);
+    const domain = username.slice(at + 1);
+    const maskedLocal =
+      local.length <= 2 ? '*'.repeat(local.length) : `${local[0]}***${local[local.length - 1]}`;
+    return `${maskedLocal}@${domain}`;
+  }
+  if (username.length <= 2) return '*'.repeat(username.length);
+  return `${username[0]}***${username[username.length - 1]}`;
+}
+
 async function main(): Promise<void> {
   const missing: string[] = [];
   if (!AGENT_RUNTIME_ARN) missing.push('AGENT_RUNTIME_ARN');
@@ -124,7 +137,7 @@ async function main(): Promise<void> {
   console.log(`  Region:           ${REGION}`);
   console.log(`  Runtime ARN:      ${AGENT_RUNTIME_ARN}`);
   console.log(`  User pool client: ${USER_POOL_CLIENT_ID}`);
-  console.log(`  Username:         ${USERNAME}`);
+  console.log(`  Username:         ${redactUsername(USERNAME)}`);
   console.log(`  Session UUID:     ${sessionId}`);
   console.log(`  URL:              ${url}`);
   console.log(`  Prompt:           "${PROMPT}"\n`);
