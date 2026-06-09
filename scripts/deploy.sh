@@ -1,6 +1,10 @@
 #!/bin/bash
 # deploy.sh — Deploy the AgentCore Runtime Security Sample stack.
 #
+# Architecture:
+#   API Gateway → Lambda Authorizer → Proxy Lambda (in private VPC)
+#   → bedrock-agentcore VPC endpoint → AgentCore Runtime (OAuth inbound)
+#
 # Usage:
 #   chmod +x scripts/deploy.sh
 #   ./scripts/deploy.sh
@@ -71,20 +75,24 @@ echo " Stack Outputs"
 echo "============================================="
 
 if [ -f cdk-outputs.json ]; then
-  # Extract outputs from the CDK outputs file
   STACK_NAME=$(node -e "const o=require('./cdk-outputs.json'); console.log(Object.keys(o)[0])")
-  API_URL=$(node -e "const o=require('./cdk-outputs.json'); console.log(o['${STACK_NAME}'].ApiUrl || 'N/A')")
-  USER_POOL_ID=$(node -e "const o=require('./cdk-outputs.json'); console.log(o['${STACK_NAME}'].UserPoolId || 'N/A')")
-  USER_POOL_CLIENT_ID=$(node -e "const o=require('./cdk-outputs.json'); console.log(o['${STACK_NAME}'].UserPoolClientId || 'N/A')")
-  THROTTLE_TABLE_NAME=$(node -e "const o=require('./cdk-outputs.json'); console.log(o['${STACK_NAME}'].ThrottleTableName || 'N/A')")
-  REGION=$(node -e "const o=require('./cdk-outputs.json'); console.log(o['${STACK_NAME}'].Region || 'N/A')")
-  VPC_ID=$(node -e "const o=require('./cdk-outputs.json'); console.log(o['${STACK_NAME}'].VpcId || 'N/A')")
+  get_output() {
+    node -e "const o=require('./cdk-outputs.json'); console.log(o['${STACK_NAME}']['$1'] || 'N/A')"
+  }
+  API_URL=$(get_output 'ApiUrl')
+  USER_POOL_ID=$(get_output 'UserPoolId')
+  USER_POOL_CLIENT_ID=$(get_output 'UserPoolClientId')
+  THROTTLE_TABLE_NAME=$(get_output 'ThrottleTableName')
+  REGION=$(get_output 'Region')
+  AGENT_RUNTIME_ARN=$(get_output 'AgentRuntimeArn')
+  VPC_ID=$(get_output 'VpcId')
 
   echo "  API_URL:              ${API_URL}"
   echo "  USER_POOL_ID:         ${USER_POOL_ID}"
   echo "  USER_POOL_CLIENT_ID:  ${USER_POOL_CLIENT_ID}"
   echo "  THROTTLE_TABLE_NAME:  ${THROTTLE_TABLE_NAME}"
   echo "  REGION:               ${REGION}"
+  echo "  AGENT_RUNTIME_ARN:    ${AGENT_RUNTIME_ARN}"
   echo "  VPC_ID:               ${VPC_ID}"
   echo ""
   echo "Export these for use with seed-data and test scripts:"
@@ -95,7 +103,7 @@ if [ -f cdk-outputs.json ]; then
   echo "  export THROTTLE_TABLE_NAME=\"${THROTTLE_TABLE_NAME}\""
   echo "  export AWS_REGION=\"${REGION}\""
   echo "  export VPC_ID=\"${VPC_ID}\""
- 
+
 else
   echo "  (cdk-outputs.json not found — check CDK deploy output above)"
 fi

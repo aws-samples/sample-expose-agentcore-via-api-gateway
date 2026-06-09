@@ -1,7 +1,20 @@
 #!/bin/bash
-# test-security-controls.sh — Validate the security best practices.
+# test-security-controls.sh — Validate the deployed security controls.
 #
-# Reads seed UUIDs from scripts/seed-output.json (written by seed-data.ts).
+# Architecture under test:
+#   API Gateway → Lambda Authorizer → Proxy Lambda (in private VPC)
+#   → bedrock-agentcore VPC endpoint → AgentCore Runtime (OAuth inbound)
+#
+# This script validates five boundary behaviors against the deployed stack:
+#   1. Inbound: a valid JWT + valid UUID is allowed end to end.
+#   2. Missing Authorization header is blocked at API Gateway.
+#   3. Non-UUID X-Session-Id is denied by the authorizer.
+#   4. Composite session hashing keeps two users isolated even when one
+#      reuses the other's client UUID.
+#   5. The deployed VPC has no IGW and no NAT (outbound isolation).
+#
+# Reads seed UUIDs and passwords from scripts/seed-output.json (written by
+# seed-data.ts).
 #
 # Usage:
 #   export API_URL=<from CDK output>
@@ -26,6 +39,7 @@ echo ""
 : "${USER_POOL_ID:?ERROR: USER_POOL_ID is not set.}"
 : "${USER_POOL_CLIENT_ID:?ERROR: USER_POOL_CLIENT_ID is not set.}"
 : "${AWS_REGION:?ERROR: AWS_REGION is not set.}"
+: "${VPC_ID:?ERROR: VPC_ID is not set.}"
 
 if [ ! -f "${SEED_OUTPUT}" ]; then
   echo "ERROR: ${SEED_OUTPUT} not found."
@@ -53,7 +67,7 @@ get_jwt() {
     --client-id "${USER_POOL_CLIENT_ID}" \
     --auth-flow USER_PASSWORD_AUTH \
     --auth-parameters "USERNAME=${1},PASSWORD=${2}" \
-    --query 'AuthenticationResult.IdToken' \
+    --query 'AuthenticationResult.AccessToken' \
     --output text
 }
 
@@ -71,10 +85,9 @@ record_result() {
 }
 
 # =========================================================================
-# TEST 1: INBOUND SECURITY — API Gateway + Lambda Authorizer
-# Valid JWT + any UUID v4 should pass through the authorizer
+# TEST 1: INBOUND — valid JWT + valid UUID v4 is allowed end to end
 # =========================================================================
-echo "TEST 1: Inbound Security (API Gateway + Lambda Authorizer)"
+echo "TEST 1: Inbound — valid JWT + UUID v4 allowed"
 echo "  Authenticating user1@test.com..."
 JWT_USER1=$(get_jwt "user1@test.com" "${PASSWORD_USER1}")
 
@@ -90,53 +103,18 @@ echo "  Response: ${HTTP_STATUS}"
 # 200 = full success. 4xx/5xx other than 401/403 from the authorizer still
 # mean the authorizer ALLOWED the request and the error came from the backend.
 if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "504" ] || [ "$HTTP_STATUS" = "404" ] || [ "$HTTP_STATUS" = "500" ]; then
-  RESULTS+=("PASS | Inbound Security (authorizer allowed valid request, status: ${HTTP_STATUS})")
+  RESULTS+=("PASS | Inbound (authorizer allowed valid request, status: ${HTTP_STATUS})")
   PASS=$((PASS + 1))
 else
-  RESULTS+=("FAIL | Inbound Security (expected 200/504/404/500, got ${HTTP_STATUS})")
+  RESULTS+=("FAIL | Inbound (expected 200/504/404/500, got ${HTTP_STATUS})")
   FAIL=$((FAIL + 1))
 fi
 echo ""
 
 # =========================================================================
-# TEST 2: OUTBOUND SECURITY — VPC with no internet egress
+# TEST 2: MISSING AUTHORIZATION HEADER — blocked at API Gateway
 # =========================================================================
-echo "TEST 2: Outbound Security (VPC network isolation)"
-VPC_ID="${VPC_ID:-}"
-
-if [ -n "$VPC_ID" ]; then
-  IGW_COUNT=$(aws ec2 describe-internet-gateways \
-    --region "${AWS_REGION}" \
-    --filters "Name=attachment.vpc-id,Values=${VPC_ID}" \
-    --query 'InternetGateways | length(@)' \
-    --output text 2>/dev/null || echo "error")
-
-  NAT_COUNT=$(aws ec2 describe-nat-gateways \
-    --region "${AWS_REGION}" \
-    --filter "Name=vpc-id,Values=${VPC_ID}" "Name=state,Values=available" \
-    --query 'NatGateways | length(@)' \
-    --output text 2>/dev/null || echo "error")
-
-  echo "  Internet Gateways: ${IGW_COUNT}, NAT Gateways: ${NAT_COUNT}"
-
-  if [ "$IGW_COUNT" = "0" ] && [ "$NAT_COUNT" = "0" ]; then
-    RESULTS+=("PASS | Outbound Security (no IGW, no NAT)")
-    PASS=$((PASS + 1))
-  else
-    RESULTS+=("FAIL | Outbound Security (IGW: ${IGW_COUNT}, NAT: ${NAT_COUNT})")
-    FAIL=$((FAIL + 1))
-  fi
-else
-  echo "  VPC_ID not set — skipping"
-  RESULTS+=("SKIP | Outbound Security (VPC_ID not set)")
-fi
-echo ""
-
-# =========================================================================
-# TEST 3: RUNTIME DIRECT ACCESS PREVENTION
-# Request without Authorization header should be rejected at API Gateway
-# =========================================================================
-echo "TEST 3: Runtime Direct Access Prevention"
+echo "TEST 2: Missing Authorization header → 401"
 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
   -X POST "${API_URL}invoke" \
   -H "X-Session-Id: ${SESSION_USER1}" \
@@ -144,14 +122,13 @@ HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
   -d '{"prompt": "bypass attempt"}')
 
 echo "  Response: ${HTTP_STATUS}"
-record_result "Runtime Direct Access (no auth → blocked at API Gateway)" "401" "${HTTP_STATUS}"
+record_result "Missing Authorization header → 401 Unauthorized" "401" "${HTTP_STATUS}"
 echo ""
 
 # =========================================================================
-# TEST 4: INVALID SESSION FORMAT REJECTION
-# Authorizer rejects non-UUID session IDs before any downstream work
+# TEST 3: INVALID SESSION FORMAT — authorizer denies non-UUID
 # =========================================================================
-echo "TEST 4: Invalid Session Format Rejection"
+echo "TEST 3: Non-UUID X-Session-Id → 403"
 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
   -X POST "${API_URL}invoke" \
   -H "Authorization: Bearer ${JWT_USER1}" \
@@ -160,20 +137,28 @@ HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
   -d '{"prompt": "malformed session id"}')
 
 echo "  Response: ${HTTP_STATUS}"
-record_result "Invalid session format → 403 Deny" "403" "${HTTP_STATUS}"
+record_result "Invalid session format → 403 Forbidden" "403" "${HTTP_STATUS}"
 echo ""
 
 # =========================================================================
-# TEST 5: SESSION ISOLATION — composite hashing makes UUID reuse harmless
-# User2 reusing User1's client UUID lands on a different AgentCore session
-# because compositeSessionId = sha256(uuid:jwtSub) differs per user.
-# The authorizer ALLOWS both (no 403): isolation is cryptographic, not a deny.
+# TEST 4: SESSION ISOLATION — composite hashing makes UUID reuse harmless
+#
+# Threat model: an authenticated user (user2) tries to reach another
+# authenticated user's (user1) AgentCore session by sending user1's UUID.
+# JWT validation alone does not stop this — both users have valid JWTs.
+#
+# Mitigation: the authorizer computes
+#   runtimeSessionId = sha256(<X-Session-Id> : <jwtSub>)
+# Two users with the same UUID produce different composite hashes. AgentCore
+# Runtime treats runtimeSessionId as opaque, so they land on different
+# sessions and never share state. The authorizer ALLOWS both — isolation is
+# cryptographic, not a deny.
 # =========================================================================
-echo "TEST 5: Session Isolation (composite hashing)"
+echo "TEST 4: Session isolation — composite hashing"
 echo "  Authenticating user2@test.com..."
 JWT_USER2=$(get_jwt "user2@test.com" "${PASSWORD_USER2}")
 
-echo "  user2 reusing user1's UUID — should be ALLOWED (different composite hash)..."
+echo "  user2 reusing user1's UUID — should be ALLOWED on a different composite session..."
 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
   -X POST "${API_URL}invoke" \
   -H "Authorization: Bearer ${JWT_USER2}" \
@@ -183,10 +168,37 @@ HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
 
 echo "  Response: ${HTTP_STATUS}"
 if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "504" ] || [ "$HTTP_STATUS" = "404" ] || [ "$HTTP_STATUS" = "500" ]; then
-  RESULTS+=("PASS | Session Isolation (user2 allowed — lands on distinct composite session, status: ${HTTP_STATUS})")
+  RESULTS+=("PASS | Session isolation (user2 lands on a distinct composite session, status: ${HTTP_STATUS})")
   PASS=$((PASS + 1))
 else
-  RESULTS+=("FAIL | Session Isolation (expected 200/504/404/500, got ${HTTP_STATUS})")
+  RESULTS+=("FAIL | Session isolation (expected 200/504/404/500, got ${HTTP_STATUS})")
+  FAIL=$((FAIL + 1))
+fi
+echo ""
+
+# =========================================================================
+# TEST 5: OUTBOUND ISOLATION — VPC has no IGW and no NAT
+# =========================================================================
+echo "TEST 5: Outbound isolation (VPC has no IGW / no NAT)"
+
+IGW_COUNT=$(aws ec2 describe-internet-gateways \
+  --region "${AWS_REGION}" \
+  --filters "Name=attachment.vpc-id,Values=${VPC_ID}" \
+  --query 'InternetGateways | length(@)' \
+  --output text 2>/dev/null || echo "error")
+
+NAT_COUNT=$(aws ec2 describe-nat-gateways \
+  --region "${AWS_REGION}" \
+  --filter "Name=vpc-id,Values=${VPC_ID}" "Name=state,Values=available" \
+  --query 'NatGateways | length(@)' \
+  --output text 2>/dev/null || echo "error")
+
+echo "  Internet Gateways: ${IGW_COUNT}, NAT Gateways: ${NAT_COUNT}"
+if [ "$IGW_COUNT" = "0" ] && [ "$NAT_COUNT" = "0" ]; then
+  RESULTS+=("PASS | Outbound isolation (no IGW, no NAT)")
+  PASS=$((PASS + 1))
+else
+  RESULTS+=("FAIL | Outbound isolation (IGW: ${IGW_COUNT}, NAT: ${NAT_COUNT})")
   FAIL=$((FAIL + 1))
 fi
 echo ""
