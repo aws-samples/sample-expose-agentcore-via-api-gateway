@@ -16,7 +16,7 @@ sequenceDiagram
     participant C as Client
     participant G as API Gateway
     participant A as Lambda Authorizer
-    participant K as Cognito (JWKS)
+    participant K as Cognito<br/>(JWKS / Discovery)
     participant D as DynamoDB<br/>(Throttle)
     participant P as Proxy Lambda<br/>(in VPC)
     participant V as bedrock-agentcore<br/>VPC endpoint
@@ -50,9 +50,13 @@ sequenceDiagram
         G->>P: Invoke proxy<br/>(with authorizer context)
         Note over P: Forward user JWT unchanged.<br/>No SigV4. Add header:<br/>X-Amzn-Bedrock-AgentCore-<br/>Runtime-Session-Id = compositeSessionId
         P->>V: HTTPS POST /runtimes/.../invocations<br/>Authorization: Bearer JWT
-        V->>I: Validate JWT
-        Note over I: AgentCore Identity validates the JWT<br/>against Cognito user pool's<br/>discovery URL.
-        I->>R: Authorized → check resource policy<br/>aws:SourceVpc == this stack's VPC
+        V->>R: Request enters via VPC endpoint<br/>(aws:SourceVpc populated)
+        R->>I: Delegate JWT validation
+        I->>K: GET /.well-known/openid-configuration<br/>(cached)
+        K-->>I: Discovery doc + signing keys
+        I->>I: Verify signature, issuer,<br/>client_id ∈ allowedClients
+        I-->>R: JWT valid
+        R->>R: Evaluate resource-based policy<br/>(aws:SourceVpc == this stack's VPC)
         R-->>P: Agent response (stream)
         P-->>G: 200 + body
         G-->>C: 200 + agent response
