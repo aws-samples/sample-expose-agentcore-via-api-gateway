@@ -1,34 +1,32 @@
 #!/usr/bin/env ts-node
 /**
- * Direct AgentCore Runtime invocation test (JWT, from outside the VPC).
+ * Direct AgentCore Runtime invocation test (JWT, bypassing the Gateway).
  *
- * Authenticates against Cognito to obtain a valid access token, then calls
- * the AgentCore Runtime data plane directly over the public internet with
+ * Authenticates against Cognito to obtain a valid access token, then calls the
+ * AgentCore Runtime data plane directly over the public internet with
  *   `Authorization: Bearer <JWT>`.
  *
- * Expected outcome: the Runtime resource-based policy rejects the call with
- *   `AccessDeniedException`
- * because the request does not traverse this stack's VPC endpoint and
- * therefore does not carry `aws:SourceVpc` in its request context. This is
- * **expected behavior** and demonstrates that the perimeter is doing its
- * job — even a valid JWT from your registered IdP cannot reach the agent
- * if the call originates from outside your VPC.
+ * Expected outcome: the Runtime rejects the call (AccessDeniedException /
+ * 403) because the runtime's inbound authorizer is configured with
+ *   customJWTAuthorizer.allowedWorkloadConfiguration.hostingEnvironments = [thisGateway]
+ * A request that does not flow through the Gateway does not carry the Gateway's
+ * workload identity in its identity chain, so it is denied — EVEN with a valid
+ * JWT from your registered IdP. This is **expected behavior** and demonstrates
+ * that the perimeter is doing its job.
  *
- * The only valid path remains:
- *   API Gateway → Lambda Authorizer → Proxy Lambda (in VPC)
- *               → bedrock-agentcore VPC endpoint → AgentCore Runtime
+ * This replaces the previous aws:SourceVpc perimeter: with the VPC/proxy
+ * removed, "the call must come through my Gateway" is now enforced by the
+ * runtime's allowedWorkloadConfiguration rather than by a VPC-scoped resource
+ * policy. The only valid path is:
+ *   Client → AgentCore Gateway (CUSTOM_JWT) → REQUEST interceptor
+ *          → AgentCore Runtime (workload-locked to this Gateway).
  *
- * Auto-reads AGENT_RUNTIME_ARN, USER_POOL_CLIENT_ID, and AWS_REGION from
+ * Auto-reads AGENT_RUNTIME_ARN, USER_POOL_CLIENT_ID, and Region from
  * cdk-outputs.json, and reads test-user credentials from
  * scripts/seed-output.json (written by `npx ts-node scripts/seed-data.ts`).
  *
  * Usage:
  *   npx ts-node scripts/test-agent-direct.ts
- *
- *   # Or with overrides:
- *   export AGENT_RUNTIME_ARN=<arn>
- *   export USER_POOL_CLIENT_ID=<id>
- *   export AWS_REGION=<region>
  *   npx ts-node scripts/test-agent-direct.ts "What can you do?"
  */
 
@@ -43,6 +41,7 @@ import * as path from 'path';
 interface CdkOutputs {
   AgentRuntimeArn?: string;
   UserPoolClientId?: string;
+  GatewayUrl?: string;
   Region?: string;
 }
 
@@ -80,6 +79,7 @@ const USER_POOL_CLIENT_ID =
   process.env.USER_POOL_CLIENT_ID || cdkOutputs.UserPoolClientId || '';
 const REGION =
   process.env.AWS_REGION || cdkOutputs.Region || 'us-east-1';
+const GATEWAY_URL = process.env.GATEWAY_URL || cdkOutputs.GatewayUrl || '<GatewayUrl>';
 const USERNAME = process.env.USERNAME || 'user1@test.com';
 const PASSWORD = process.env.PASSWORD || seedOutput.user1Password || '';
 const PROMPT = process.argv[2] ?? 'Hello, are you working?';
@@ -133,7 +133,7 @@ async function main(): Promise<void> {
   const sessionId = crypto.randomUUID();
   const url = buildRuntimeUrl(AGENT_RUNTIME_ARN, REGION);
 
-  console.log('=== Direct AgentCore Runtime Invocation Test (JWT, from laptop) ===\n');
+  console.log('=== Direct AgentCore Runtime Invocation Test (JWT, bypassing the Gateway) ===\n');
   console.log(`  Region:           ${REGION}`);
   console.log(`  Runtime ARN:      ${AGENT_RUNTIME_ARN}`);
   console.log(`  User pool client: ${USER_POOL_CLIENT_ID}`);
@@ -152,7 +152,7 @@ async function main(): Promise<void> {
   }
   console.log('  Got access_token (truncated):', jwt.slice(0, 20) + '...\n');
 
-  console.log('Invoking AgentCore Runtime directly with the JWT (no VPC endpoint)...');
+  console.log('Invoking AgentCore Runtime directly with the JWT (not through the Gateway)...');
   const startTime = Date.now();
 
   const response = await fetch(url, {
@@ -161,11 +161,9 @@ async function main(): Promise<void> {
       Authorization: `Bearer ${jwt}`,
       'Content-Type': 'application/json',
       Accept: 'application/json',
+      // Any value >= 33 chars satisfies the runtime's session-id length rule;
+      // the call is denied by the workload perimeter before it matters.
       'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id':
-        // Pad to >= 33 chars to satisfy the runtime's session-id length requirement.
-        // (The full sample uses sha256(uuid:jwtSub) which is 64 chars; here we just
-        // need any value long enough — the call won't get past the resource policy
-        // anyway in a properly deployed stack.)
         crypto.createHash('sha256').update(`${sessionId}:direct-test`).digest('hex'),
     },
     body: JSON.stringify({ prompt: PROMPT }),
@@ -178,14 +176,14 @@ async function main(): Promise<void> {
   console.log(`  HTTP status: ${response.status} ${response.statusText}`);
   console.log(`  Body: ${body || '(empty)'}\n`);
 
-  if (response.status === 403 || /AccessDenied/i.test(body)) {
-    console.log('=== RESULT: 403 / AccessDeniedException ===\n');
-    console.log('This is the expected outcome. The Cognito JWT is valid, but the call');
-    console.log('did not traverse this stack\'s VPC endpoint, so `aws:SourceVpc` is not');
-    console.log('populated in the request context. The Runtime resource-based policy');
-    console.log('denies the call. The perimeter is doing its job.\n');
-    console.log('Reach the agent through the documented path:');
-    console.log('  curl -X POST "${API_URL}invoke" \\');
+  if (response.status === 403 || response.status === 401 || /AccessDenied|not allowed|workload/i.test(body)) {
+    console.log('=== RESULT: denied (403 / AccessDeniedException) ===\n');
+    console.log('This is the expected outcome. The Cognito JWT is valid, but the call did');
+    console.log('not flow through the Gateway, so its identity chain does not include the');
+    console.log('Gateway workload. The runtime\'s allowedWorkloadConfiguration rejects it.');
+    console.log('The perimeter is doing its job.\n');
+    console.log('Reach the agent through the only valid path — the Gateway:');
+    console.log(`  curl -X POST "${GATEWAY_URL.replace(/\/$/, '')}/runtime/invocations" \\`);
     console.log('    -H "Authorization: Bearer <jwt>" \\');
     console.log('    -H "X-Session-Id: <uuid-v4>" \\');
     console.log('    -d \'{"prompt": "..."}\'');
@@ -194,17 +192,16 @@ async function main(): Promise<void> {
 
   if (response.status >= 200 && response.status < 300) {
     console.log('=== UNEXPECTED: 2xx ===\n');
-    console.log('The runtime accepted a JWT-authenticated call from outside the VPC.');
-    console.log('That means the resource-based policy is missing, misconfigured, or the');
-    console.log('runtime is not OAuth-inbound. Check:');
-    console.log('  1. lib/agentcore-security-stack.ts — RuntimeResourcePolicy / RuntimeEndpointResourcePolicy');
-    console.log('  2. CloudFormation deployment status of the AwsCustomResource resources');
-    console.log('  3. The Runtime\'s authorizerConfiguration in the AWS console');
+    console.log('The runtime accepted a JWT-authenticated call that bypassed the Gateway.');
+    console.log('That means the workload lock is missing or misconfigured. Check:');
+    console.log('  1. lib/agentcore-security-stack.ts — the CfnRuntime AllowedWorkloadConfiguration override');
+    console.log('  2. Whether CloudFormation accepted AllowedWorkloadConfiguration (see deploy-time note in the stack)');
+    console.log('  3. The Runtime authorizerConfiguration in the AWS console / get-agent-runtime');
     process.exit(2);
   }
 
   console.log('=== UNEXPECTED status code ===\n');
-  console.log('Neither a denial (403/AccessDeniedException) nor a 2xx success.');
+  console.log('Neither a denial (401/403/AccessDeniedException) nor a 2xx success.');
   console.log('Possible causes: JWT misconfiguration, runtime not yet ACTIVE, network issues.');
   process.exit(3);
 }

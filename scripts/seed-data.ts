@@ -2,10 +2,10 @@
 /**
  * Seed Cognito test users for the security sample.
  *
- * The authorizer no longer reads a DynamoDB session-binding record — session
- * isolation is enforced cryptographically via the composite session ID
+ * The REQUEST interceptor no longer reads a DynamoDB session-binding record —
+ * session isolation is enforced cryptographically via the composite session ID
  * (sha256(uuid:jwtSub)). Clients may generate any UUID v4 they like per
- * session; the authorizer will derive a user-scoped AgentCore session from it.
+ * session; the interceptor derives a user-scoped AgentCore session from it.
  *
  * This script only provisions the two test users and emits a pair of UUIDs
  * for the end-to-end security test script to reuse.

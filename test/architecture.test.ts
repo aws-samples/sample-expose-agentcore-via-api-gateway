@@ -1,17 +1,18 @@
 /**
- * Tests for the AgentCore security architecture:
- *   - API Gateway → Lambda Authorizer → Proxy Lambda (in private VPC)
- *     → bedrock-agentcore VPC endpoint → AgentCore Runtime
- *   - AgentCore Runtime configured with Cognito OAuth inbound
- *   - Resource-based policy on Runtime + DEFAULT endpoint:
- *     `Allow Principal "*"` with `aws:SourceVpc` matching this stack's VPC
- *   - VPC has private subnets only (no IGW, no NAT)
- *   - VPC endpoints: DynamoDB (gateway), CloudWatch Logs, Lambda,
- *     Bedrock AgentCore (interface)
- *   - VPC endpoint policy on bedrock-agentcore VPCe restricts to
- *     Proxy Lambda's role (defense-in-depth alongside the resource policy)
- *   - Proxy Lambda forwards the user's JWT (no SigV4) and uses Lambda
- *     response streaming
+ * Tests for the AgentCore security architecture (Path 1):
+ *   Client → AgentCore Gateway (CUSTOM_JWT inbound, Cognito)
+ *          → REQUEST interceptor Lambda (JWT + UUID + composite hash + throttle)
+ *          → AgentCore Runtime (OAuth inbound, JWT_PASSTHROUGH outbound)
+ *
+ * Security invariants encoded here:
+ *   - Gateway has CUSTOM_JWT inbound + a REQUEST interceptor (passRequestHeaders)
+ *   - Runtime is OAuth inbound AND locked to this Gateway via
+ *     allowedWorkloadConfiguration (the perimeter that replaces aws:SourceVpc)
+ *   - Runtime target uses JWT_PASSTHROUGH (OBO preserved)
+ *   - Runtime allowlists the Authorization header through to the agent
+ *   - Interceptor keeps JWT validation + composite hash + throttling + fail-secure
+ *   - No VPC / NAT / IGW / VPC endpoints, no proxy Lambda, no API Gateway
+ *   - Throttle table + Guardrail + INVALID_JWT alarm intact
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -30,163 +31,171 @@ beforeAll(() => {
   template = Template.fromStack(stack);
 });
 
-describe('Architecture: API Gateway → Proxy Lambda (in VPC) → AgentCore Runtime', () => {
-  test('VPC exists with private subnets only (no IGW, no NAT)', () => {
-    template.hasResourceProperties('AWS::EC2::VPC', { CidrBlock: '10.0.0.0/16' });
+/** Collect all Custom::AWS resources' serialized onCreate payloads. */
+function customResourceCreatePayloads(): string[] {
+  const customResources = template.findResources('Custom::AWS');
+  return Object.values(customResources).map((r) => {
+    const create = r.Properties?.Create;
+    return typeof create === 'string' ? create : JSON.stringify(create);
+  });
+}
+
+describe('Perimeter removal: no VPC, no proxy, no API Gateway', () => {
+  test('No VPC, NAT, IGW, or VPC endpoints remain', () => {
+    expect(Object.keys(template.findResources('AWS::EC2::VPC'))).toHaveLength(0);
     expect(Object.keys(template.findResources('AWS::EC2::NatGateway'))).toHaveLength(0);
     expect(Object.keys(template.findResources('AWS::EC2::InternetGateway'))).toHaveLength(0);
+    expect(Object.keys(template.findResources('AWS::EC2::VPCEndpoint'))).toHaveLength(0);
   });
 
-  test('VPC endpoints exist: DynamoDB (Gateway), CloudWatch Logs, Lambda, Bedrock AgentCore (Interface)', () => {
-    template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
-      VpcEndpointType: 'Gateway',
-      ServiceName: Match.objectLike({ 'Fn::Join': Match.arrayWith([Match.arrayWith([Match.stringLikeRegexp('dynamodb')])]) }),
-    });
-    template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
-      VpcEndpointType: 'Interface',
-      ServiceName: Match.stringLikeRegexp('com\\.amazonaws\\..*\\.logs'),
-    });
-    template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
-      VpcEndpointType: 'Interface',
-      ServiceName: Match.stringLikeRegexp('com\\.amazonaws\\..*\\.lambda'),
-    });
-    template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
-      VpcEndpointType: 'Interface',
-      ServiceName: Match.stringLikeRegexp('com\\.amazonaws\\..*\\.bedrock-agentcore'),
-    });
+  test('No API Gateway remains', () => {
+    expect(Object.keys(template.findResources('AWS::ApiGateway::RestApi'))).toHaveLength(0);
+    expect(Object.keys(template.findResources('AWS::ApiGateway::Method'))).toHaveLength(0);
   });
 
-  test('Proxy Lambda exists in the VPC, no internet egress', () => {
-    template.hasResourceProperties('AWS::Lambda::Function', {
-      Runtime: 'nodejs22.x',
-      VpcConfig: Match.objectLike({
-        SecurityGroupIds: Match.anyValue(),
-        SubnetIds: Match.anyValue(),
+  test('No Lambda function runs inside a VPC (proxy removed)', () => {
+    const fns = template.findResources('AWS::Lambda::Function');
+    for (const fn of Object.values(fns)) {
+      expect(fn.Properties?.VpcConfig).toBeUndefined();
+    }
+  });
+});
+
+describe('AgentCore Gateway: CUSTOM_JWT inbound + REQUEST interceptor', () => {
+  test('A CreateGateway custom resource exists with CUSTOM_JWT (Cognito) inbound and NO protocolType', () => {
+    const payloads = customResourceCreatePayloads();
+    const gw = payloads.find((p) => p.includes('CreateGateway') && p.includes('CUSTOM_JWT'));
+    expect(gw).toBeDefined();
+    expect(gw).toContain('customJWTAuthorizer');
+    expect(gw).toContain('.well-known/openid-configuration');
+    // Protocol-less gateway (required for AgentCore Runtime HTTP targets).
+    expect(gw).not.toContain('protocolType');
+  });
+
+  test('The gateway attaches a REQUEST interceptor with passRequestHeaders', () => {
+    const gw = customResourceCreatePayloads().find((p) => p.includes('CreateGateway'));
+    expect(gw).toBeDefined();
+    expect(gw).toContain('interceptorConfigurations');
+    expect(gw).toContain('REQUEST');
+    expect(gw).toContain('passRequestHeaders');
+  });
+
+  test('The gateway execution role can invoke the interceptor Lambda and the Runtime', () => {
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: Match.objectLike({
+        Statement: Match.arrayWith([
+          Match.objectLike({ Action: 'lambda:InvokeFunction' }),
+        ]),
       }),
-      Environment: { Variables: Match.objectLike({ AGENT_RUNTIME_ARN: Match.anyValue() }) },
+    });
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: Match.objectLike({
+        Statement: Match.arrayWith([
+          Match.objectLike({ Action: 'bedrock-agentcore:InvokeAgentRuntime' }),
+        ]),
+      }),
     });
   });
+});
 
-  test('Proxy Lambda security group has explicit egress only to VPC endpoints on 443', () => {
-    // CDK with allowAllOutbound:false creates separate SecurityGroupEgress
-    // resources for each explicit rule. Verify a TCP/443 rule exists.
-    template.hasResourceProperties('AWS::EC2::SecurityGroupEgress', {
-      IpProtocol: 'tcp',
-      FromPort: 443,
-      ToPort: 443,
-    });
-  });
-
-  test('API Gateway integration is AWS_PROXY → response-streaming-invocations (Lambda streaming)', () => {
-    template.hasResourceProperties('AWS::ApiGateway::Method', {
-      HttpMethod: 'POST',
-      Integration: Match.objectLike({
-        Type: 'AWS_PROXY',
-        Uri: Match.objectLike({
-          'Fn::Join': Match.arrayWith([
-            Match.arrayWith([Match.stringLikeRegexp('response-streaming-invocations')]),
-          ]),
+describe('AgentCore Runtime: OAuth inbound + workload lock + JWT passthrough target', () => {
+  test('Runtime is OAuth inbound (CustomJWTAuthorizer, Cognito discovery URL)', () => {
+    template.hasResourceProperties('AWS::BedrockAgentCore::Runtime', {
+      AuthorizerConfiguration: Match.objectLike({
+        CustomJWTAuthorizer: Match.objectLike({
+          DiscoveryUrl: Match.objectLike({
+            'Fn::Join': Match.arrayWith([
+              Match.arrayWith([Match.stringLikeRegexp('cognito-idp\\..*\\.amazonaws\\.com')]),
+            ]),
+          }),
         }),
       }),
     });
   });
 
-  test('Resource-based policy is applied to the Runtime ARN with Allow + Principal "*" + aws:SourceVpc condition', () => {
-    const customResources = template.findResources('Custom::AWS');
-    const policyEntries = Object.values(customResources).filter((r) => {
-      const create = r.Properties?.Create;
-      const createStr = typeof create === 'string' ? create : JSON.stringify(create);
-      return createStr.includes('PutResourcePolicy') && createStr.includes('AllowOAuthFromVpc');
-    });
-    expect(policyEntries.length).toBeGreaterThanOrEqual(2); // runtime + DEFAULT endpoint
-
-    // The serialized policy is multi-level escaped (CloudFormation Fn::Join
-    // wrapping a JSON.stringified inner-value JSON). Validate the key
-    // semantic tokens are present rather than matching escape levels.
-    for (const r of policyEntries) {
-      const created = JSON.stringify(r.Properties.Create);
-      expect(created).toContain('AllowOAuthFromVpc');
-      expect(created).toContain('Allow');
-      expect(created).toContain('bedrock-agentcore:InvokeAgentRuntime');
-      expect(created).toContain('aws:SourceVpc');
-      // Wildcard principal: the `*` survives all escaping.
-      expect(created).toContain('Principal');
-      expect(created).toMatch(/Principal[^,]*\*/);
+  test('Runtime is locked to the Gateway workload via allowedWorkloadConfiguration (perimeter)', () => {
+    // CloudFormation does not accept AllowedWorkloadConfiguration on the runtime
+    // resource, so the workload lock is applied post-create via an
+    // UpdateAgentRuntime custom resource.
+    const upd = customResourceCreatePayloads().find((p) => p.includes('UpdateAgentRuntime'));
+    expect(upd).toBeDefined();
+    expect(upd).toContain('allowedWorkloadConfiguration');
+    expect(upd).toContain('hostingEnvironments');
+    // And it must NOT be (incorrectly) left on the CFN runtime resource.
+    const runtimes = template.findResources('AWS::BedrockAgentCore::Runtime');
+    for (const r of Object.values(runtimes)) {
+      const authz = r.Properties?.AuthorizerConfiguration?.CustomJWTAuthorizer ?? {};
+      expect(authz.AllowedWorkloadConfiguration).toBeUndefined();
     }
   });
 
-  test('Resource-based policy is applied to the DEFAULT endpoint as well (both runtime and runtime-endpoint/DEFAULT)', () => {
-    const customResources = template.findResources('Custom::AWS');
-    const endpointPolicy = Object.values(customResources).find((r) => {
-      const create = r.Properties?.Create;
-      const createStr = typeof create === 'string' ? create : JSON.stringify(create);
-      return createStr.includes('runtime-endpoint/DEFAULT') && createStr.includes('PutResourcePolicy');
-    });
-    expect(endpointPolicy).toBeDefined();
-  });
-
-  test('VPC endpoint policy on bedrock-agentcore VPCe explicitly allows InvokeAgentRuntime from any caller in the VPC', () => {
-    template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
-      ServiceName: Match.stringLikeRegexp('bedrock-agentcore'),
-      PolicyDocument: Match.objectLike({
-        Statement: Match.arrayWith([
-          Match.objectLike({
-            Effect: 'Allow',
-            // Bare "*" — required for OAuth-anonymous callers per the
-            // AgentCore docs. AnyPrincipal produces { AWS: "*" } which
-            // does not match anonymous calls.
-            Principal: '*',
-            Action: 'bedrock-agentcore:InvokeAgentRuntime',
-          }),
-        ]),
+  test('Runtime allowlists the Authorization header for OBO (RequestHeaderConfiguration)', () => {
+    template.hasResourceProperties('AWS::BedrockAgentCore::Runtime', {
+      RequestHeaderConfiguration: Match.objectLike({
+        RequestHeaderAllowlist: Match.arrayWith(['Authorization']),
       }),
     });
   });
 
-  test('Stack outputs include VpcId, runtime ARN/ID, throttle table name, and pool IDs', () => {
-    const outputKeys = Object.keys(template.findOutputs('*'));
-    expect(outputKeys).toEqual(expect.arrayContaining([
-      expect.stringContaining('ApiUrl'),
-      expect.stringContaining('UserPoolId'),
-      expect.stringContaining('UserPoolClientId'),
-      expect.stringContaining('ThrottleTableName'),
-      expect.stringContaining('Region'),
-      expect.stringContaining('VpcId'),
-      expect.stringContaining('AgentRuntimeArn'),
-    ]));
+  test('Gateway target routes to the Runtime as an HTTP target with JWT_PASSTHROUGH (OBO)', () => {
+    const tgt = customResourceCreatePayloads().find((p) => p.includes('CreateGatewayTarget'));
+    expect(tgt).toBeDefined();
+    expect(tgt).toContain('agentcoreRuntime');
+    expect(tgt).toContain('JWT_PASSTHROUGH');
   });
 });
 
-describe('Proxy Lambda code: JWT pass-through, no SigV4', () => {
-  const proxyFile = path.join(__dirname, '..', 'lambda', 'gateway', 'index.ts');
-  const content = fs.readFileSync(proxyFile, 'utf-8');
+describe('REQUEST interceptor code: JWT + composite hash + throttling + fail-secure', () => {
+  const interceptorFile = path.join(__dirname, '..', 'lambda', 'interceptor', 'index.ts');
+  const content = fs.readFileSync(interceptorFile, 'utf-8');
 
-  test('Proxy code does NOT import the Bedrock AgentCore SDK (no SigV4 path)', () => {
-    expect(content).not.toMatch(/BedrockAgentCoreClient/);
-    expect(content).not.toMatch(/InvokeAgentRuntimeCommand/);
-    expect(content).not.toMatch(/@aws-sdk\/client-bedrock-agentcore/);
+  test('Validates the JWT signature/issuer (jsonwebtoken + jwks-rsa)', () => {
+    expect(content).toMatch(/jsonwebtoken/);
+    expect(content).toMatch(/jwks-rsa/);
+    expect(content).toMatch(/jwt\.verify/);
   });
 
-  test('Proxy code uses fetch and forwards Authorization + injects session header', () => {
-    expect(content).toMatch(/await\s+fetch\(/);
-    expect(content).toMatch(/Authorization:\s*auth/);
+  test('Derives the runtime session ID as a composite hash sha256(sessionId:sub), never the raw client value', () => {
+    expect(content).toMatch(/createHash\(['"]sha256['"]\)/);
+    expect(content).toMatch(/\$\{sessionId\}:\$\{claims\.sub\}/);
+  });
+
+  test('Injects X-Amzn-Bedrock-AgentCore-Runtime-Session-Id and strips any client-supplied variant', () => {
     expect(content).toMatch(/X-Amzn-Bedrock-AgentCore-Runtime-Session-Id/);
+    expect(content).toMatch(/RUNTIME_SESSION_HEADER/);
   });
 
-  test('Proxy code reads composite session ID from authorizer context', () => {
-    expect(content).toMatch(/event\.requestContext\?\.authorizer\?\.compositeSessionId/);
+  test('Validates UUID v4 format for the client session id', () => {
+    expect(content).toMatch(/\[0-9a-f\]\{8\}-\[0-9a-f\]\{4\}/);
   });
 
-  test('Proxy code uses Lambda response streaming', () => {
-    expect(content).toMatch(/awslambda\.streamifyResponse/);
+  test('Enforces per-user session + per-session invocation limits via DynamoDB conditional writes', () => {
+    expect(content).toMatch(/ConditionExpression/);
+    expect(content).toMatch(/sessionCount < :max/);
+    expect(content).toMatch(/invocationCount < :max/);
+    expect(content).toMatch(/USER#/);
+    expect(content).toMatch(/INVOCATIONS#/);
   });
 
-  test('Proxy code requires AGENT_RUNTIME_ARN env var', () => {
-    expect(content).toMatch(/process\.env\.AGENT_RUNTIME_ARN/);
+  test('Fails secure: every rejection returns a transformedGatewayResponse deny and the handler never throws', () => {
+    expect(content).toMatch(/transformedGatewayResponse/);
+    // A catch-all that denies rather than rethrows.
+    expect(content).toMatch(/INTERNAL_ERROR/);
+    expect(content).toMatch(/return deny\(/);
+  });
+
+  test('Emits INVALID_JWT for observability', () => {
+    expect(content).toMatch(/INVALID_JWT/);
+  });
+
+  test('Is not a VPC proxy: no fetch-to-runtime, no response streaming, no SigV4 SDK', () => {
+    expect(content).not.toMatch(/streamifyResponse/);
+    expect(content).not.toMatch(/@aws-sdk\/client-bedrock-agentcore/);
+    expect(content).not.toMatch(/AGENT_RUNTIME_ARN/);
   });
 });
 
-describe('Supporting resources: Cognito, DynamoDB, Guardrail, monitoring', () => {
+describe('Supporting resources: Cognito, DynamoDB, Guardrail, monitoring, outputs', () => {
   test('Cognito UserPool, DynamoDB throttle table, Bedrock Guardrail, INVALID_JWT alarm all exist', () => {
     template.hasResourceProperties('AWS::Cognito::UserPool', { UserPoolName: 'agentcore-security-users' });
     template.hasResourceProperties('AWS::DynamoDB::Table', {
@@ -202,17 +211,25 @@ describe('Supporting resources: Cognito, DynamoDB, Guardrail, monitoring', () =>
     template.hasResourceProperties('AWS::CloudWatch::Alarm', { Threshold: 5 });
   });
 
-  test('Runtime is configured with CustomJWTAuthorizer (Cognito OAuth inbound)', () => {
-    template.hasResourceProperties('AWS::BedrockAgentCore::Runtime', {
-      AuthorizerConfiguration: Match.objectLike({
-        CustomJWTAuthorizer: Match.objectLike({
-          DiscoveryUrl: Match.objectLike({
-            'Fn::Join': Match.arrayWith([
-              Match.arrayWith([Match.stringLikeRegexp('cognito-idp\\..*\\.amazonaws\\.com')]),
-            ]),
-          }),
-        }),
-      }),
+  test('Interceptor Lambda has the throttle table env var and no AGENT_RUNTIME_ARN', () => {
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Runtime: 'nodejs22.x',
+      Environment: { Variables: Match.objectLike({ THROTTLE_TABLE_NAME: Match.anyValue() }) },
     });
+  });
+
+  test('Stack outputs include the Gateway URL/ARN and runtime/pool identifiers, not ApiUrl/VpcId', () => {
+    const outputKeys = Object.keys(template.findOutputs('*'));
+    expect(outputKeys).toEqual(expect.arrayContaining([
+      expect.stringContaining('GatewayUrl'),
+      expect.stringContaining('GatewayArn'),
+      expect.stringContaining('UserPoolId'),
+      expect.stringContaining('UserPoolClientId'),
+      expect.stringContaining('ThrottleTableName'),
+      expect.stringContaining('Region'),
+      expect.stringContaining('AgentRuntimeArn'),
+    ]));
+    expect(outputKeys.some((k) => k.includes('ApiUrl'))).toBe(false);
+    expect(outputKeys.some((k) => k.includes('VpcId'))).toBe(false);
   });
 });

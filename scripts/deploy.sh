@@ -1,9 +1,11 @@
 #!/bin/bash
 # deploy.sh — Deploy the AgentCore Runtime Security Sample stack.
 #
-# Architecture:
-#   API Gateway → Lambda Authorizer → Proxy Lambda (in private VPC)
-#   → bedrock-agentcore VPC endpoint → AgentCore Runtime (OAuth inbound)
+# Architecture (Path 1 — OAuth inbound + JWT pass-through):
+#   Client → AgentCore Gateway (CUSTOM_JWT inbound, Cognito)
+#          → REQUEST interceptor Lambda (JWT + UUID + composite hash + throttle)
+#          → AgentCore Runtime (OAuth inbound, JWT_PASSTHROUGH outbound)
+#   The Runtime is locked to this Gateway via allowedWorkloadConfiguration.
 #
 # Usage:
 #   chmod +x scripts/deploy.sh
@@ -79,30 +81,34 @@ if [ -f cdk-outputs.json ]; then
   get_output() {
     node -e "const o=require('./cdk-outputs.json'); console.log(o['${STACK_NAME}']['$1'] || 'N/A')"
   }
-  API_URL=$(get_output 'ApiUrl')
+  API_URL=$(get_output 'GatewayUrl')
+  GATEWAY_ID=$(get_output 'GatewayId')
+  GATEWAY_ARN=$(get_output 'GatewayArn')
   USER_POOL_ID=$(get_output 'UserPoolId')
   USER_POOL_CLIENT_ID=$(get_output 'UserPoolClientId')
   THROTTLE_TABLE_NAME=$(get_output 'ThrottleTableName')
   REGION=$(get_output 'Region')
   AGENT_RUNTIME_ARN=$(get_output 'AgentRuntimeArn')
-  VPC_ID=$(get_output 'VpcId')
 
-  echo "  API_URL:              ${API_URL}"
+  echo "  GATEWAY_URL:          ${API_URL}"
+  echo "  GATEWAY_ID:           ${GATEWAY_ID}"
+  echo "  GATEWAY_ARN:          ${GATEWAY_ARN}"
   echo "  USER_POOL_ID:         ${USER_POOL_ID}"
   echo "  USER_POOL_CLIENT_ID:  ${USER_POOL_CLIENT_ID}"
   echo "  THROTTLE_TABLE_NAME:  ${THROTTLE_TABLE_NAME}"
   echo "  REGION:               ${REGION}"
   echo "  AGENT_RUNTIME_ARN:    ${AGENT_RUNTIME_ARN}"
-  echo "  VPC_ID:               ${VPC_ID}"
   echo ""
   echo "Export these for use with seed-data and test scripts:"
   echo ""
-  echo "  export API_URL=\"${API_URL}\""
+  echo "  export GATEWAY_URL=\"${API_URL}\""
+  echo "  export GATEWAY_ID=\"${GATEWAY_ID}\""
+  echo "  export GATEWAY_ARN=\"${GATEWAY_ARN}\""
   echo "  export USER_POOL_ID=\"${USER_POOL_ID}\""
   echo "  export USER_POOL_CLIENT_ID=\"${USER_POOL_CLIENT_ID}\""
   echo "  export THROTTLE_TABLE_NAME=\"${THROTTLE_TABLE_NAME}\""
   echo "  export AWS_REGION=\"${REGION}\""
-  echo "  export VPC_ID=\"${VPC_ID}\""
+  echo "  export AGENT_RUNTIME_ARN=\"${AGENT_RUNTIME_ARN}\""
 
 else
   echo "  (cdk-outputs.json not found — check CDK deploy output above)"

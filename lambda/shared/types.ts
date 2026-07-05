@@ -1,5 +1,5 @@
 /**
- * Decoded JWT claims from a Cognito-issued ID token.
+ * Decoded JWT claims from a Cognito-issued token.
  * The `sub` field is the key identity claim used to derive the composite
  * session ID that is passed downstream to AgentCore Runtime.
  */
@@ -7,7 +7,7 @@ export interface JWTClaims {
   /** User identity — mixed into the composite session hash */
   sub: string;
   /** User email address */
-  email: string;
+  email?: string;
   /** Optional Cognito group memberships */
   'cognito:groups'?: string[];
   /** Issued at — Unix epoch seconds */
@@ -16,10 +16,12 @@ export interface JWTClaims {
   exp: number;
   /** Cognito issuer URL */
   iss: string;
-  /** Client ID (audience) */
-  aud: string;
-  /** Token type — always 'id' for ID tokens */
-  token_use: 'id';
+  /** Audience (ID tokens) */
+  aud?: string;
+  /** Client ID (access tokens) */
+  client_id?: string;
+  /** Token type — 'id' or 'access' */
+  token_use?: string;
 }
 
 /**
@@ -29,7 +31,7 @@ export interface JWTClaims {
  *   - `INVOCATIONS#<compositeSessionId>` → per-session invocation count
  *
  * The table is not used for session binding or ownership — that is enforced
- * cryptographically by the composite hash in the authorizer.
+ * cryptographically by the composite hash in the interceptor.
  */
 export interface ThrottleRecord {
   /** Partition key — `USER#<sub>` or `INVOCATIONS#<compositeSessionId>` */
@@ -45,41 +47,75 @@ export interface ThrottleRecord {
 }
 
 /**
- * Lambda Authorizer request event from API Gateway (REQUEST type).
+ * AgentCore Gateway REQUEST interceptor input for an HTTP (AgentCore Runtime)
+ * target. See:
+ * https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html
+ *
+ * `headers` is present only when the interceptor is configured with
+ * `passRequestHeaders: true`. `body` is a base64-encoded string of the raw
+ * HTTP request body. `httpMethod` is read-only.
  */
-export interface AuthorizerEvent {
-  /** Authorizer type — always 'REQUEST' for request-based authorizers */
-  type: 'REQUEST';
-  /** API Gateway method ARN used to generate the IAM policy */
-  methodArn: string;
-  /** HTTP headers from the client request */
-  headers: Record<string, string>;
-  /** Request context including client identity */
-  requestContext: {
-    identity: { sourceIp: string };
+export interface InterceptorRequestEvent {
+  interceptorInputVersion: string;
+  http: {
+    gatewayRequest: {
+      path: string;
+      httpMethod: string;
+      /** Present only when passRequestHeaders=true */
+      headers?: Record<string, string>;
+      /** base64-encoded raw request body */
+      body: string;
+    };
   };
 }
 
 /**
- * Lambda Authorizer response returned to API Gateway.
- * Contains an IAM policy document and optional context passed to downstream Lambdas.
+ * Custom values the gateway passes to an HTTP-target interceptor via the
+ * Lambda invocation client context (`clientContext.Custom`).
+ * `GATEWAY_ARN`, `GATEWAY_ACCOUNT_ID`, and `REQUEST_ID` are always present;
+ * `SOURCE_IP` is optional.
  */
-export interface AuthorizerResponse {
-  /** The principal identifier for the policy */
-  principalId: string;
-  /** IAM policy document with a single Allow or Deny statement */
-  policyDocument: {
-    Version: '2012-10-17';
-    Statement: [{
-      Action: 'execute-api:Invoke';
-      Effect: 'Allow' | 'Deny';
-      Resource: string;
-    }];
-  };
-  /** Context values passed to downstream Lambda functions */
-  context: {
-    userId: string;
-    sessionId: string;
-    compositeSessionId: string;
+export interface InterceptorClientContext {
+  GATEWAY_ARN?: string;
+  GATEWAY_ACCOUNT_ID?: string;
+  REQUEST_ID?: string;
+  SOURCE_IP?: string;
+}
+
+/**
+ * Allow output — forward a (possibly header-modified) request to the target.
+ * We echo the original headers plus the injected composite session-ID header,
+ * and echo the original base64 body unchanged.
+ */
+export interface InterceptorAllowResponse {
+  interceptorOutputVersion: '1.0';
+  http: {
+    transformedGatewayRequest: {
+      headers: Record<string, string>;
+      /** base64-encoded body, unchanged */
+      body: string;
+    };
   };
 }
+
+/**
+ * Deny output (fail-secure short-circuit). When `transformedGatewayResponse`
+ * is present the gateway returns it immediately WITHOUT calling the target.
+ * `body` must be base64-encoded.
+ */
+export interface InterceptorDenyResponse {
+  interceptorOutputVersion: '1.0';
+  http: {
+    transformedGatewayResponse: {
+      statusCode: number;
+      contentType: string;
+      headers?: Record<string, string>;
+      /** base64-encoded body */
+      body: string;
+    };
+  };
+}
+
+export type InterceptorResponse =
+  | InterceptorAllowResponse
+  | InterceptorDenyResponse;
