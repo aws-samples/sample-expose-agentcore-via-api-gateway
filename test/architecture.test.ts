@@ -1,15 +1,21 @@
 /**
- * Tests for the AgentCore security architecture (Path 1):
+ * Tests for the AgentCore security architecture:
  *   Client → AgentCore Gateway (CUSTOM_JWT inbound, Cognito)
- *          → REQUEST interceptor Lambda (JWT + UUID + composite hash + throttle)
- *          → AgentCore Runtime (OAuth inbound, JWT_PASSTHROUGH outbound)
+ *          → REQUEST interceptor Lambda (JWT + UUID + composite hash + throttle
+ *            + verified-identity injection)
+ *          → AgentCore Runtime (OAuth inbound; Gateway uses OAUTH client-
+ *            credentials outbound so allowedWorkloadConfiguration is satisfied)
  *
  * Security invariants encoded here:
  *   - Gateway has CUSTOM_JWT inbound + a REQUEST interceptor (passRequestHeaders)
  *   - Runtime is OAuth inbound AND locked to this Gateway via
  *     allowedWorkloadConfiguration (the perimeter that replaces aws:SourceVpc)
- *   - Runtime target uses JWT_PASSTHROUGH (OBO preserved)
- *   - Runtime allowlists the Authorization header through to the agent
+ *   - Runtime target uses OAUTH client-credentials outbound (via an AgentCore
+ *     Identity credential provider) — the Identity-brokered path that lets the
+ *     workload lock be satisfied (JWT pass-through cannot satisfy it)
+ *   - The user identity reaches the agent via interceptor-injected verified
+ *     headers (X-Verified-User-Sub / X-User-Authorization), which the runtime
+ *     allowlists through
  *   - Interceptor keeps JWT validation + composite hash + throttling + fail-secure
  *   - No VPC / NAT / IGW / VPC endpoints, no proxy Lambda, no API Gateway
  *   - Throttle table + Guardrail + INVALID_JWT alarm intact
@@ -129,19 +135,68 @@ describe('AgentCore Runtime: OAuth inbound + workload lock + JWT passthrough tar
     }
   });
 
-  test('Runtime allowlists the Authorization header for OBO (RequestHeaderConfiguration)', () => {
+  test('Runtime allowlists the verified user identity headers for OBO (RequestHeaderConfiguration)', () => {
     template.hasResourceProperties('AWS::BedrockAgentCore::Runtime', {
       RequestHeaderConfiguration: Match.objectLike({
-        RequestHeaderAllowlist: Match.arrayWith(['Authorization']),
+        RequestHeaderAllowlist: Match.arrayWith(['X-Verified-User-Sub', 'X-User-Authorization']),
       }),
     });
   });
 
-  test('Gateway target routes to the Runtime as an HTTP target with JWT_PASSTHROUGH (OBO)', () => {
+  test('Gateway target routes to the Runtime as an HTTP target with OAUTH client-credentials outbound', () => {
     const tgt = customResourceCreatePayloads().find((p) => p.includes('CreateGatewayTarget'));
     expect(tgt).toBeDefined();
     expect(tgt).toContain('agentcoreRuntime');
-    expect(tgt).toContain('JWT_PASSTHROUGH');
+    // OAuth outbound via an AgentCore Identity credential provider — the path
+    // that lets allowedWorkloadConfiguration be satisfied.
+    expect(tgt).toContain('OAUTH');
+    expect(tgt).toContain('oauthCredentialProvider');
+    expect(tgt).toContain('CLIENT_CREDENTIALS');
+    // The old pass-through mode must be gone (it cannot satisfy the lock).
+    expect(tgt).not.toContain('JWT_PASSTHROUGH');
+  });
+});
+
+describe('OAuth outbound identity: M2M client, credential provider, gateway token permissions', () => {
+  test('A Cognito resource server, hosted domain, and M2M (client-credentials) app client exist', () => {
+    template.hasResourceProperties('AWS::Cognito::UserPoolResourceServer', {
+      Identifier: 'agentcore-runtime',
+    });
+    expect(Object.keys(template.findResources('AWS::Cognito::UserPoolDomain'))).not.toHaveLength(0);
+    template.hasResourceProperties('AWS::Cognito::UserPoolClient', {
+      GenerateSecret: true,
+      AllowedOAuthFlows: Match.arrayWith(['client_credentials']),
+    });
+  });
+
+  test('A credential-provider provisioner Lambda exists with Cognito + Oauth2CredentialProvider permissions (and the M2M secret is NOT in the template)', () => {
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: Match.objectLike({
+        Statement: Match.arrayWith([
+          Match.objectLike({ Action: 'cognito-idp:DescribeUserPoolClient' }),
+          Match.objectLike({ Action: Match.arrayWith(['bedrock-agentcore:CreateOauth2CredentialProvider']) }),
+        ]),
+      }),
+    });
+    // The generated M2M client secret must never be rendered into the template.
+    expect(JSON.stringify(template.toJSON())).not.toMatch(/ClientSecret/);
+  });
+
+  test('Gateway role can fetch the outbound OAuth token and read the provider secret', () => {
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: Match.objectLike({
+        Statement: Match.arrayWith([
+          Match.objectLike({ Action: 'bedrock-agentcore:GetResourceOauth2Token' }),
+          Match.objectLike({ Action: 'secretsmanager:GetSecretValue' }),
+        ]),
+      }),
+    });
+  });
+
+  test('Runtime validates the M2M client token (allowedClients set via the workload-lock update)', () => {
+    const upd = customResourceCreatePayloads().find((p) => p.includes('UpdateAgentRuntime'));
+    expect(upd).toBeDefined();
+    expect(upd).toContain('allowedClients');
   });
 });
 
@@ -163,6 +218,15 @@ describe('REQUEST interceptor code: JWT + composite hash + throttling + fail-sec
   test('Injects X-Amzn-Bedrock-AgentCore-Runtime-Session-Id and strips any client-supplied variant', () => {
     expect(content).toMatch(/X-Amzn-Bedrock-AgentCore-Runtime-Session-Id/);
     expect(content).toMatch(/RUNTIME_SESSION_HEADER/);
+  });
+
+  test('Injects VERIFIED user identity headers only after JWT validation, and strips client-supplied variants', () => {
+    expect(content).toMatch(/X-Verified-User-Sub/);
+    expect(content).toMatch(/X-User-Authorization/);
+    expect(content).toMatch(/STRIPPED_CLIENT_HEADERS/);
+    // The verified token forwarded is the validated bearer token (claims/token
+    // come from jwt.verify above), passed into allow().
+    expect(content).toMatch(/allow\(rawHeaders, compositeSessionId, base64Body, claims\.sub, token\)/);
   });
 
   test('Validates UUID v4 format for the client session id', () => {

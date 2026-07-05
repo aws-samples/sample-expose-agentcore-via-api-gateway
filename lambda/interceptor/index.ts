@@ -7,17 +7,22 @@
  * front of an AgentCore Runtime (HTTP) target:
  *
  *   Client → AgentCore Gateway (CUSTOM_JWT inbound) → THIS interceptor
- *          → AgentCore Runtime (OAuth inbound, token pass-through)
+ *          → AgentCore Runtime (OAuth inbound; Gateway uses OAUTH client-
+ *            credentials outbound so the runtime's allowedWorkloadConfiguration
+ *            is satisfied)
  *
- * Security model (unchanged from the authorizer):
- *   - JWT is validated here (signature, issuer, expiry) AND again at the
- *     Runtime by AgentCore Identity. The Gateway's CUSTOM_JWT inbound is a
- *     third gate; re-validating here lets us emit INVALID_JWT telemetry and
- *     read `sub` for the composite hash.
+ * Security model:
+ *   - JWT is validated here (signature, issuer, expiry). The Gateway's
+ *     CUSTOM_JWT inbound is the first gate; re-validating here lets us emit
+ *     INVALID_JWT telemetry, read `sub` for the composite hash, and forward a
+ *     TRUSTED user identity to the agent.
  *   - The runtime session ID is a composite hash sha256(<X-Session-Id>:<sub>),
- *     never the raw client value, so user A can never reach user B's session.
- *     It is injected as X-Amzn-Bedrock-AgentCore-Runtime-Session-Id on the
- *     request forwarded to the Runtime target.
+ *     never the raw client value, injected as
+ *     X-Amzn-Bedrock-AgentCore-Runtime-Session-Id.
+ *   - Because the Gateway's OAuth outbound replaces Authorization with its M2M
+ *     token, the user identity is propagated to the agent via interceptor-set
+ *     verified headers (X-Verified-User-Sub, X-User-Authorization) — set only
+ *     after JWT validation, with any client-supplied variants stripped.
  *   - Per-user session and per-session invocation limits via DynamoDB
  *     conditional writes.
  *
@@ -53,6 +58,24 @@ const SESSION_TTL_SECONDS = parseInt(process.env.SESSION_TTL_HOURS ?? '24', 10) 
 
 /** Canonical header AgentCore Runtime reads for the session identifier. */
 const RUNTIME_SESSION_HEADER = 'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id';
+
+/**
+ * Verified user-identity headers injected on allow. The Gateway's OAuth
+ * outbound replaces Authorization with the M2M token, so the runtime no longer
+ * sees the user's token. To preserve OBO we forward the user's identity — only
+ * AFTER validating the JWT here — in these interceptor-controlled headers,
+ * which the runtime allowlists through to the agent. Any client-supplied
+ * variants are stripped so the agent can trust these values.
+ */
+const VERIFIED_USER_SUB_HEADER = 'X-Verified-User-Sub';
+const VERIFIED_USER_TOKEN_HEADER = 'X-User-Authorization';
+
+/** Interceptor-controlled headers stripped from the client-supplied set. */
+const STRIPPED_CLIENT_HEADERS = [
+  RUNTIME_SESSION_HEADER.toLowerCase(),
+  VERIFIED_USER_SUB_HEADER.toLowerCase(),
+  VERIFIED_USER_TOKEN_HEADER.toLowerCase(),
+];
 
 const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
@@ -127,24 +150,30 @@ export function deny(statusCode: number, code: string, message: string): Interce
 
 /**
  * Build an allow that forwards the request to the Runtime target.
- * Echoes the original headers (so token pass-through still has Authorization),
- * strips any client-supplied session header (never trust the client for the
- * runtime session ID), and injects the user-bound composite session ID.
+ * Echoes the original headers, strips any interceptor-controlled header the
+ * client tried to set, injects the user-bound composite session ID, and
+ * injects the VERIFIED user identity (sub + original bearer token) for OBO.
+ * The user token is forwarded here — after JWT validation — because the
+ * Gateway's OAuth outbound overwrites Authorization with the M2M token.
  */
 export function allow(
   originalHeaders: Record<string, string>,
   compositeSessionId: string,
   base64Body: string,
+  verifiedSub: string,
+  verifiedUserToken: string,
 ): InterceptorResponse {
   const headers: Record<string, string> = {};
   for (const [key, value] of Object.entries(originalHeaders)) {
-    // Drop any case-variant of the runtime session header — we set it ourselves.
-    if (key.toLowerCase() === RUNTIME_SESSION_HEADER.toLowerCase()) {
+    // Drop any case-variant of interceptor-controlled headers — we set them.
+    if (STRIPPED_CLIENT_HEADERS.includes(key.toLowerCase())) {
       continue;
     }
     headers[key] = value;
   }
   headers[RUNTIME_SESSION_HEADER] = compositeSessionId;
+  headers[VERIFIED_USER_SUB_HEADER] = verifiedSub;
+  headers[VERIFIED_USER_TOKEN_HEADER] = `Bearer ${verifiedUserToken}`;
   return {
     interceptorOutputVersion: '1.0',
     http: { transformedGatewayRequest: { headers, body: base64Body } },
@@ -284,9 +313,10 @@ export async function handler(
       }
     }
 
-    // Step 6: All checks pass — forward with the injected composite session ID.
+    // Step 6: All checks pass — forward with the injected composite session ID
+    // and the verified user identity headers (sub + validated bearer token).
     logAuthorization({ userId: claims.sub, sessionId, compositeSessionId, decision: 'Allow', reason: 'AUTHORIZED', timestamp: now, sourceIp });
-    return allow(rawHeaders, compositeSessionId, base64Body);
+    return allow(rawHeaders, compositeSessionId, base64Body, claims.sub, token);
   } catch {
     // Catch-all: fail-secure on any unexpected error (never throw).
     logAuthorization({ decision: 'Deny', reason: 'INTERNAL_ERROR', timestamp: now, sourceIp });

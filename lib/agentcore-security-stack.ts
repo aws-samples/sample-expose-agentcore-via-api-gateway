@@ -2,17 +2,23 @@
  * AgentCoreSecurityStack — defense-in-depth for Amazon Bedrock AgentCore Runtime,
  * fronted by an AgentCore Gateway (MCP-less HTTP target) instead of API Gateway.
  *
- * Architecture (Path 1 — OAuth inbound + token pass-through):
+ * Architecture (OAuth inbound + OAUTH client-credentials outbound):
  *   Client → AgentCore Gateway (CUSTOM_JWT inbound, Cognito)
- *          → REQUEST interceptor Lambda (JWT + UUID + composite hash + throttle)
- *          → AgentCore Runtime (OAuth inbound, JWT pass-through)
+ *          → REQUEST interceptor Lambda (JWT + UUID + composite hash + throttle
+ *            + verified-identity injection)
+ *          → AgentCore Runtime (OAuth inbound, OAUTH client-credentials outbound)
  *
- * The user's Cognito JWT is validated at the Gateway (CUSTOM_JWT inbound), again
- * in the interceptor (defense in depth + to read `sub` and emit INVALID_JWT
- * telemetry), and again at the Runtime by AgentCore Identity. The Gateway
- * forwards the user's bearer token UNCHANGED to the Runtime (JWT_PASSTHROUGH
- * outbound), so the user identity reaches the agent (OBO) — the Gateway replaces
- * the old VPC-resident proxy Lambda.
+ * The user's Cognito JWT is validated at the Gateway (CUSTOM_JWT inbound) and
+ * again in the interceptor (defense in depth + to read `sub`, emit INVALID_JWT
+ * telemetry, and forward a trusted identity). The Gateway's Runtime target uses
+ * OAUTH client-credentials outbound: it fetches a machine token from an AgentCore
+ * Identity credential provider (backed by a Cognito M2M client) and forwards THAT
+ * to the Runtime. That Identity-brokered token is what stamps the Gateway's
+ * workload identity so the Runtime's allowedWorkloadConfiguration is satisfied —
+ * JWT pass-through cannot do this (verified live: "Transaction token required").
+ * Because the Runtime's Authorization is now the Gateway's M2M token, the
+ * interceptor forwards the verified user identity (X-Verified-User-Sub /
+ * X-User-Authorization) so the agent can still act on behalf of the user (OBO).
  *
  * The "no bypass" perimeter that used to be enforced by a VPC + aws:SourceVpc
  * resource policy is now enforced natively: the Runtime's
@@ -21,10 +27,11 @@
  * is rejected because its identity chain does not include the Gateway.
  *
  * Customer-side controls implemented:
- *   1. JWT validation at the Gateway (CUSTOM_JWT) + interceptor + Runtime OAuth
+ *   1. JWT validation at the Gateway (CUSTOM_JWT) + interceptor
  *   2. Session ownership binding     — runtimeSessionId = sha256(uuid:jwtSub)
- *   3. Per-user / per-session throttling — DynamoDB conditional writes
- *   4. OAuth inbound at the Runtime  — AgentCore Identity (Cognito JWT)
+ *   3. OBO — OAUTH outbound stamps the workload id; interceptor injects the
+ *            verified user identity headers the runtime allowlists to the agent
+ *   4. Per-user / per-session throttling — DynamoDB conditional writes
  *   5. Runtime perimeter             — allowedWorkloadConfiguration locks the
  *                                      runtime to this Gateway's workload only
  *   6. Prompt-layer protection       — Amazon Bedrock Guardrails (in-agent)
@@ -56,6 +63,7 @@ import {
   AwsCustomResourcePolicy,
   PhysicalResourceId,
   PhysicalResourceIdReference,
+  Provider,
 } from 'aws-cdk-lib/custom-resources';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
@@ -99,6 +107,136 @@ export class AgentCoreSecurityStack extends cdk.Stack {
 
     const cognitoIssuer = `https://cognito-idp.${this.region}.amazonaws.com/${userPool.userPoolId}`;
     const discoveryUrl = `${cognitoIssuer}/.well-known/openid-configuration`;
+
+    // =====================================================================
+    // OUTBOUND (M2M) IDENTITY — used by the Gateway's OAuth outbound auth to
+    // the Runtime target. The Gateway does NOT forward the user's raw token to
+    // the runtime; instead it obtains a client-credentials token via AgentCore
+    // Identity. That Identity-brokered exchange is what stamps the Gateway's
+    // workload identity onto the request, which is what the runtime's
+    // `allowedWorkloadConfiguration` validates. (JWT pass-through never touches
+    // AgentCore Identity and therefore cannot satisfy the workload lock — this
+    // is the mechanism that makes the "no bypass" perimeter actually work.)
+    //
+    // The user's identity still reaches the agent: the interceptor validates
+    // the user JWT and injects verified identity headers (see the interceptor
+    // and the runtime RequestHeaderConfiguration below).
+    // =====================================================================
+
+    const invokeScope = new cognito.ResourceServerScope({
+      scopeName: 'invoke',
+      scopeDescription: 'Invoke the runtime through the gateway',
+    });
+    const runtimeResourceServer = userPool.addResourceServer('RuntimeResourceServer', {
+      identifier: 'agentcore-runtime',
+      scopes: [invokeScope],
+    });
+    // Full scope string as it appears in the token: "<identifier>/<scopeName>".
+    const m2mScope = 'agentcore-runtime/invoke';
+
+    // Hosted domain — Cognito only exposes a working OAuth2 token endpoint
+    // (for the client-credentials grant) through a hosted domain; the OIDC
+    // discovery URL alone does not serve client-credentials.
+    const userPoolDomain = userPool.addDomain('OboDomain', {
+      cognitoDomain: { domainPrefix: `agentcore-sec-${uniqueSuffix}` },
+    });
+
+    // Machine-to-machine app client the Gateway uses for outbound tokens.
+    // generateSecret: the secret is read at deploy time by the credential-
+    // provider provisioner Lambda (never rendered into the template).
+    const m2mClient = new cognito.UserPoolClient(this, 'M2mClient', {
+      userPool,
+      userPoolClientName: 'agentcore-m2m-client',
+      generateSecret: true,
+      oAuth: {
+        flows: { clientCredentials: true },
+        scopes: [cognito.OAuthScope.resourceServer(runtimeResourceServer, invokeScope)],
+      },
+    });
+    m2mClient.node.addDependency(runtimeResourceServer);
+
+    // AgentCore Identity OAuth2 credential provider (CognitoOauth2). Created by
+    // a dedicated provisioner Lambda so the M2M client secret is read at deploy
+    // time (via DescribeUserPoolClient) and handed straight to AgentCore
+    // Identity — it never lands in the CloudFormation template. See
+    // lambda/credential-provider/index.ts for the rationale.
+    const credentialProviderName = `agentcore-cog-m2m-${uniqueSuffix}`;
+
+    const credentialProviderFn = new lambdaNodejs.NodejsFunction(this, 'CredentialProviderProvisioner', {
+      entry: path.join(__dirname, '..', 'lambda', 'credential-provider', 'index.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: cdk.Duration.seconds(60),
+      memorySize: 256,
+      bundling: {
+        minify: true,
+        sourceMap: true,
+        // The Lambda runtime provides @aws-sdk/client-cognito-identity-provider,
+        // but NOT @aws-sdk/client-bedrock-agentcore-control (newer client), so
+        // override the default '@aws-sdk/*' external list to bundle the latter.
+        externalModules: ['@aws-sdk/client-cognito-identity-provider'],
+      },
+    });
+    credentialProviderFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['cognito-idp:DescribeUserPoolClient'],
+      resources: [userPool.userPoolArn],
+    }));
+    credentialProviderFn.addToRolePolicy(new iam.PolicyStatement({
+      // Credential-provider ARNs are server-generated, so scope to the account's
+      // default token vault rather than an unknown-at-synth ARN.
+      actions: [
+        'bedrock-agentcore:CreateOauth2CredentialProvider',
+        'bedrock-agentcore:UpdateOauth2CredentialProvider',
+        'bedrock-agentcore:DeleteOauth2CredentialProvider',
+        'bedrock-agentcore:GetOauth2CredentialProvider',
+        // CreateOauth2CredentialProvider lazily ensures the account's default
+        // token vault exists on first use, so the provisioner must be able to
+        // create/get it.
+        'bedrock-agentcore:CreateTokenVault',
+        'bedrock-agentcore:GetTokenVault',
+      ],
+      resources: [
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/default`,
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/default/*`,
+      ],
+    }));
+    // AgentCore Identity stores the credential provider's client secret in a
+    // service-managed Secrets Manager secret, created/updated/deleted using the
+    // CALLER's credentials — so the provisioner needs these on that managed
+    // prefix. Scoped to bedrock-agentcore-identity!default/oauth2/*.
+    credentialProviderFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: [
+        'secretsmanager:CreateSecret',
+        'secretsmanager:PutSecretValue',
+        'secretsmanager:UpdateSecret',
+        'secretsmanager:DescribeSecret',
+        'secretsmanager:GetSecretValue',
+        'secretsmanager:TagResource',
+        'secretsmanager:DeleteSecret',
+      ],
+      resources: [
+        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:bedrock-agentcore-identity!default/oauth2/*`,
+      ],
+    }));
+
+    const credentialProviderProvider = new Provider(this, 'CredentialProviderProvider', {
+      onEventHandler: credentialProviderFn,
+    });
+
+    const credentialProviderCr = new cdk.CustomResource(this, 'OauthCredentialProvider', {
+      serviceToken: credentialProviderProvider.serviceToken,
+      properties: {
+        PoolId: userPool.userPoolId,
+        ClientId: m2mClient.userPoolClientId,
+        Name: credentialProviderName,
+        AuthorizationEndpoint: `${userPoolDomain.baseUrl()}/oauth2/authorize`,
+        TokenEndpoint: `${userPoolDomain.baseUrl()}/oauth2/token`,
+        Issuer: cognitoIssuer,
+      },
+    });
+    credentialProviderCr.node.addDependency(m2mClient);
+    credentialProviderCr.node.addDependency(userPoolDomain);
+    const credentialProviderArn = credentialProviderCr.getAttString('ProviderArn');
 
     // =====================================================================
     // THROTTLE TABLE — partition key `pk` with synthetic prefixed keys:
@@ -212,6 +350,30 @@ export class AgentCoreSecurityStack extends cdk.Stack {
       resources: [
         `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default`,
         `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default/workload-identity/*`,
+      ],
+    }));
+
+    // OAuth outbound to the Runtime target: the Gateway assumes this role to
+    // fetch a client-credentials token from AgentCore Identity
+    // (GetResourceOauth2Token, keyed on the Gateway's workload identity) and to
+    // read the credential provider's stored client secret from Secrets Manager.
+    // Without these the outbound token fetch fails and the runtime never sees a
+    // request. This is the OAuth-outbound counterpart that makes the workload
+    // lock satisfiable (JWT pass-through needs none of this — and cannot satisfy
+    // the lock).
+    gatewayRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['bedrock-agentcore:GetResourceOauth2Token'],
+      resources: [
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/default`,
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/default/*`,
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default`,
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default/workload-identity/*`,
+      ],
+    }));
+    gatewayRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: [
+        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:bedrock-agentcore-identity!default/oauth2/*`,
       ],
     }));
 
@@ -341,7 +503,10 @@ export class AgentCoreSecurityStack extends cdk.Stack {
       description: 'Strands agent for the security reference architecture',
       authorizerConfiguration: agentcore.RuntimeAuthorizerConfiguration.usingCognito(
         userPool,
-        [userPoolClient],
+        // The runtime validates the Gateway's outbound client-credentials token
+        // (client_id = the M2M app client), NOT the end-user token. The user's
+        // identity reaches the agent via interceptor-injected verified headers.
+        [m2mClient],
       ),
       agentRuntimeArtifact: agentcore.AgentRuntimeArtifact.fromS3(
         {
@@ -360,9 +525,12 @@ export class AgentCoreSecurityStack extends cdk.Stack {
 
     const cfnRuntime = agentRuntime.node.defaultChild as CfnRuntime;
 
-    // OBO: allow the passed-through Authorization header through to the agent.
-    // (RequestHeaderConfiguration IS supported by the CloudFormation resource.)
-    cfnRuntime.addPropertyOverride('RequestHeaderConfiguration.RequestHeaderAllowlist', ['Authorization']);
+    // OBO: allowlist the interceptor-injected VERIFIED user identity headers
+    // through to the agent. The runtime's own Authorization now carries the
+    // Gateway's M2M token (not the user's), so the user identity is propagated
+    // via these headers, which the interceptor sets only after validating the
+    // user's JWT. (RequestHeaderConfiguration IS supported by the CFN resource.)
+    cfnRuntime.addPropertyOverride('RequestHeaderConfiguration.RequestHeaderAllowlist', ['X-Verified-User-Sub', 'X-User-Authorization']);
 
     // Perimeter (allowedWorkloadConfiguration) is applied AFTER creation via an
     // UpdateAgentRuntime custom resource below, because the CloudFormation
@@ -405,9 +573,11 @@ export class AgentCoreSecurityStack extends cdk.Stack {
 
     // =====================================================================
     // GATEWAY TARGET (via AwsCustomResource) — the AgentCore Runtime as an
-    // HTTP target with JWT_PASSTHROUGH outbound auth (forwards the user's
-    // bearer token unchanged → OBO). Created after both the Gateway and the
-    // Runtime exist.
+    // HTTP target with OAUTH (client-credentials) outbound auth. The Gateway
+    // fetches a token from the AgentCore Identity credential provider; this
+    // Identity-brokered path is what stamps the Gateway workload identity so
+    // the runtime's allowedWorkloadConfiguration accepts the call. Created
+    // after the Gateway, the Runtime, and the credential provider exist.
     // =====================================================================
 
     const targetCr = new AwsCustomResource(this, 'AgentCoreGatewayTarget', {
@@ -426,7 +596,16 @@ export class AgentCoreSecurityStack extends cdk.Stack {
             },
           },
           credentialProviderConfigurations: [
-            { credentialProviderType: 'JWT_PASSTHROUGH' },
+            {
+              credentialProviderType: 'OAUTH',
+              credentialProvider: {
+                oauthCredentialProvider: {
+                  providerArn: credentialProviderArn,
+                  grantType: 'CLIENT_CREDENTIALS',
+                  scopes: [m2mScope],
+                },
+              },
+            },
           ],
         },
         physicalResourceId: PhysicalResourceId.fromResponse('targetId'),
@@ -456,6 +635,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     });
     targetCr.node.addDependency(gatewayCr);
     targetCr.node.addDependency(agentRuntime);
+    targetCr.node.addDependency(credentialProviderCr);
 
     // =====================================================================
     // RUNTIME WORKLOAD LOCK (via AwsCustomResource) — apply
@@ -469,12 +649,17 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     const workloadLockAuthorizer = {
       customJWTAuthorizer: {
         discoveryUrl,
-        allowedClients: [userPoolClient.userPoolClientId],
+        // The runtime validates the Gateway's outbound client-credentials token
+        // (client_id = M2M app client), not the end-user token.
+        allowedClients: [m2mClient.userPoolClientId],
         allowedWorkloadConfiguration: {
           hostingEnvironments: [{ arn: gatewayArn }],
         },
       },
     };
+    // Verified user identity headers the interceptor injects (after validating
+    // the user JWT) are allowlisted through to the agent for OBO.
+    const runtimeHeaderAllowlist = { requestHeaderAllowlist: ['X-Verified-User-Sub', 'X-User-Authorization'] };
 
     const runtimeWorkloadLock = new AwsCustomResource(this, 'RuntimeWorkloadLock', {
       onCreate: {
@@ -486,7 +671,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
           networkConfiguration: { networkMode: 'PUBLIC' },
           roleArn: agentRuntime.role.roleArn,
           authorizerConfiguration: workloadLockAuthorizer,
-          requestHeaderConfiguration: { requestHeaderAllowlist: ['Authorization'] },
+          requestHeaderConfiguration: runtimeHeaderAllowlist,
         },
         physicalResourceId: PhysicalResourceId.of(`${agentRuntime.agentRuntimeId}#workload-lock`),
       },
@@ -499,7 +684,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
           networkConfiguration: { networkMode: 'PUBLIC' },
           roleArn: agentRuntime.role.roleArn,
           authorizerConfiguration: workloadLockAuthorizer,
-          requestHeaderConfiguration: { requestHeaderAllowlist: ['Authorization'] },
+          requestHeaderConfiguration: runtimeHeaderAllowlist,
         },
         physicalResourceId: PhysicalResourceId.of(`${agentRuntime.agentRuntimeId}#workload-lock`),
       },
@@ -578,9 +763,39 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     NagSuppressions.addResourceSuppressions(gatewayRole, [
       {
         id: 'AwsSolutions-IAM5',
-        reason: 'Runtime ARN + DEFAULT endpoint ARN are explicit; the DEFAULT endpoint is a sub-resource the Gateway must invoke. No wildcard on the runtime action beyond these two ARNs.',
+        reason: 'Runtime/DEFAULT-endpoint ARNs are explicit; workload-identity and token-vault sub-resources (for GetResourceOauth2Token) and the AgentCore Identity managed secret are addressed by pattern because their ids are server-generated. Secret access is scoped to the bedrock-agentcore-identity!default/oauth2/ prefix.',
       },
     ], true);
+
+    NagSuppressions.addResourceSuppressions(credentialProviderFn, [
+      { id: 'AwsSolutions-L1', reason: 'Using NODEJS_22_X — cdk-nag has not yet added it to the latest-runtime allowlist' },
+      {
+        id: 'AwsSolutions-IAM4',
+        reason: 'AWS managed policy AWSLambdaBasicExecutionRole is standard for Lambda functions',
+        appliesTo: ['Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'],
+      },
+      {
+        id: 'AwsSolutions-IAM5',
+        reason: 'OAuth2 credential-provider ARNs are server-generated; scoped to the account default token vault (token-vault/default/*).',
+      },
+    ], true);
+
+    // The cr.Provider framework provisions its own onEvent Lambda + role.
+    const credProviderFramework = this.node.tryFindChild('CredentialProviderProvider');
+    if (credProviderFramework) {
+      NagSuppressions.addResourceSuppressions(credProviderFramework, [
+        { id: 'AwsSolutions-L1', reason: 'cr.Provider framework Lambda runtime is managed by CDK, not user-configurable' },
+        {
+          id: 'AwsSolutions-IAM4',
+          reason: 'cr.Provider framework role uses the AWS-managed AWSLambdaBasicExecutionRole by design',
+          appliesTo: ['Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'],
+        },
+        {
+          id: 'AwsSolutions-IAM5',
+          reason: 'cr.Provider framework grants lambda:InvokeFunction to the onEvent handler with a version wildcard by design',
+        },
+      ], true);
+    }
 
     NagSuppressions.addResourceSuppressions(agentRuntime, [
       {
@@ -622,6 +837,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'GatewayArn', { value: gatewayArn, description: 'AgentCore Gateway ARN (workload allowed to invoke the Runtime)' });
     new cdk.CfnOutput(this, 'UserPoolId', { value: userPool.userPoolId, description: 'Cognito User Pool ID' });
     new cdk.CfnOutput(this, 'UserPoolClientId', { value: userPoolClient.userPoolClientId, description: 'Cognito User Pool Client ID' });
+    new cdk.CfnOutput(this, 'M2mClientId', { value: m2mClient.userPoolClientId, description: 'Cognito M2M client id (Gateway outbound client-credentials; runtime allowedClients)' });
     new cdk.CfnOutput(this, 'ThrottleTableName', { value: throttleTable.tableName, description: 'DynamoDB throttle table name' });
     new cdk.CfnOutput(this, 'Region', { value: this.region, description: 'AWS Region' });
     new cdk.CfnOutput(this, 'AgentRuntimeArn', { value: agentRuntime.agentRuntimeArn, description: 'AgentCore Runtime ARN' });

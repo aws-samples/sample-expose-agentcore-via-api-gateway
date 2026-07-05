@@ -4,16 +4,25 @@ Strands Agents agent for the AgentCore Runtime Security Sample.
 This agent is deployed to Amazon Bedrock AgentCore Runtime and serves as the
 backend for the security reference architecture. It is fronted by an AgentCore
 Gateway that validates the caller's Cognito JWT (CUSTOM_JWT inbound), runs a
-REQUEST interceptor (session binding + throttling), and forwards the request to
-this runtime with the user's bearer token passed through unchanged
-(JWT_PASSTHROUGH outbound).
+REQUEST interceptor (session binding + throttling + verified-identity
+injection), and forwards the request to this runtime using OAUTH
+client-credentials outbound (so the runtime's ``allowedWorkloadConfiguration``
+perimeter is satisfied).
 
-Because the Gateway target uses JWT pass-through and the runtime is OAuth
-inbound, the user's identity reaches the agent: AgentCore Identity has already
-validated the token, and the Authorization header is allowlisted through to the
-agent (RequestHeaderConfiguration). We decode the claims here WITHOUT
-re-validating the signature — this is the on-behalf-of (OBO) hook where the
-agent can act as the authenticated user.
+Because the Gateway target uses OAUTH client-credentials outbound (so the
+runtime's ``allowedWorkloadConfiguration`` perimeter is satisfied), the runtime's
+``Authorization`` header carries the Gateway's M2M token — NOT the user's. The
+user's identity still reaches the agent: the REQUEST interceptor validates the
+user JWT and injects verified identity headers that the runtime allowlists
+through to the agent:
+
+  * ``X-Verified-User-Sub``     — the validated user's ``sub``
+  * ``X-User-Authorization``    — the validated user's original bearer token
+                                  (``Bearer <jwt>``), for downstream OBO / 3LO
+
+We decode the forwarded user token here WITHOUT re-validating the signature —
+the interceptor already validated it. This is the on-behalf-of (OBO) hook where
+the agent can act as the authenticated user.
 
 The handler uses async streaming so AgentCore can progressively send response
 chunks back through the Gateway.
@@ -33,19 +42,33 @@ _agent = None
 
 
 def _extract_user_claims(context):
-    """Decode the passed-through JWT for OBO. Signature is NOT re-validated —
-    AgentCore Runtime already validated it during OAuth inbound authorization."""
+    """Decode the interceptor-forwarded user token for OBO. Signature is NOT
+    re-validated — the REQUEST interceptor already validated the user JWT before
+    injecting these headers.
+
+    Prefers the interceptor-injected ``X-User-Authorization`` (the verified user
+    token). Falls back to ``Authorization`` for local/direct testing, though in
+    the deployed path ``Authorization`` carries the Gateway's M2M token, not the
+    user's."""
     try:
         request_headers = getattr(context, "request_headers", None) or {}
-        auth_header = request_headers.get("Authorization") or request_headers.get("authorization")
+        verified_sub = request_headers.get("X-Verified-User-Sub") or request_headers.get("x-verified-user-sub")
+        auth_header = (
+            request_headers.get("X-User-Authorization")
+            or request_headers.get("x-user-authorization")
+            or request_headers.get("Authorization")
+            or request_headers.get("authorization")
+        )
         if not auth_header:
+            if verified_sub:
+                logger.info("OBO identity (header only): sub=%s", verified_sub)
             return None
         token = auth_header[7:] if auth_header.startswith("Bearer ") else auth_header
         claims = jwt.decode(token, options={"verify_signature": False})
-        logger.info("OBO claims: sub=%s", claims.get("sub"))
+        logger.info("OBO claims: sub=%s (verified header sub=%s)", claims.get("sub"), verified_sub)
         return claims
     except jwt.InvalidTokenError as e:
-        logger.warning("Could not decode passed-through JWT: %s", e)
+        logger.warning("Could not decode forwarded user token: %s", e)
         return None
 
 

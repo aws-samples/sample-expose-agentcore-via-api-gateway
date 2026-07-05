@@ -2,9 +2,11 @@
 
 **Disclaimer**: This is sample code, for non-production usage. You should work with your security and legal teams to meet your organizational security, regulatory and compliance requirements before deployment.
 
-An example AWS CDK architecture for exposing [Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime.html) through an [Amazon Bedrock AgentCore Gateway](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html), deployed as a single AWS CDK stack. The Gateway is the single, governed entry point to the runtime: it validates the user's Cognito JWT (CUSTOM_JWT inbound), runs a [REQUEST interceptor](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors.html) Lambda that carries the customer-side authorization logic, and forwards the request to the runtime with the user's token passed through unchanged. The runtime is OAuth-inbound and is **locked to this Gateway** via `allowedWorkloadConfiguration`, so a valid JWT sent from anywhere other than the Gateway is rejected.
+An example AWS CDK architecture for exposing [Amazon Bedrock AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime.html) through an [Amazon Bedrock AgentCore Gateway](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html), deployed as a single AWS CDK stack. The Gateway is the single, governed entry point to the runtime: it validates the user's Cognito JWT (CUSTOM_JWT inbound), runs a [REQUEST interceptor](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors.html) Lambda that carries the customer-side authorization logic, and forwards the request to the runtime using **OAuth (client-credentials) outbound** authorization. The runtime is OAuth-inbound and is **locked to this Gateway** via `allowedWorkloadConfiguration`, so a valid JWT sent from anywhere other than the Gateway is rejected.
 
-This is a migration of the older "API Gateway + Lambda Authorizer + VPC-resident proxy Lambda" design. The Gateway absorbs three roles that were previously separate — the public entry point, inbound JWT validation, and the outbound call to the runtime — and the interceptor takes over the custom authorization logic (composite session hashing, throttling, audit logging). The VPC, VPC endpoints, and proxy Lambda are no longer needed: the "no bypass" perimeter is enforced natively by the runtime's workload lock rather than by an `aws:SourceVpc` resource policy.
+> **Why OAuth outbound and not JWT pass-through?** `allowedWorkloadConfiguration` only accepts a request when the request's identity chain includes the allowed Gateway workload. That workload identity is stamped **only when the Gateway obtains its outbound token through AgentCore Identity** (OAuth outbound). `JWT_PASSTHROUGH` relays the user's token without ever calling AgentCore Identity, so it carries no workload/transaction token and the runtime rejects it with `Transaction token required: authorizer has AllowedWorkloadConfiguration configured`. This was verified live. Because OAuth outbound replaces the user's token with the Gateway's machine token, the **user identity is propagated to the agent by the interceptor**, which injects verified identity headers (`X-Verified-User-Sub`, `X-User-Authorization`) only after validating the user's JWT — the runtime allowlists these through to the agent for on-behalf-of (OBO) use.
+
+This is a migration of the older "API Gateway + Lambda Authorizer + VPC-resident proxy Lambda" design. The Gateway absorbs three roles that were previously separate — the public entry point, inbound JWT validation, and the outbound call to the runtime — and the interceptor takes over the custom authorization logic (composite session hashing, throttling, audit logging, verified-identity injection). The VPC, VPC endpoints, and proxy Lambda are no longer needed: the "no bypass" perimeter is enforced natively by the runtime's workload lock rather than by an `aws:SourceVpc` resource policy.
 
 ## Architecture
 
@@ -47,11 +49,12 @@ sequenceDiagram
         I-->>G: transformedGatewayResponse (deny)
         G-->>C: 401 / 403 / 429
     else All checks pass
-        I-->>G: transformedGatewayRequest<br/>+ X-Amzn-Bedrock-AgentCore-Runtime-Session-Id
-        Note over G,R: JWT_PASSTHROUGH — forward the<br/>user's bearer token unchanged
-        G->>R: POST invocations (Bearer JWT)
-        R->>R: OAuth inbound: AgentCore Identity<br/>validates JWT (Cognito discovery)
+        I-->>G: transformedGatewayRequest<br/>+ X-Amzn-Bedrock-AgentCore-Runtime-Session-Id<br/>+ X-Verified-User-Sub / X-User-Authorization
+        Note over G,R: OAuth outbound — Gateway gets a<br/>client-credentials (M2M) token via<br/>AgentCore Identity (stamps workload id)
+        G->>R: POST invocations (Bearer M2M token<br/>+ verified user headers)
+        R->>R: OAuth inbound: AgentCore Identity<br/>validates the M2M token (Cognito discovery)
         R->>R: allowedWorkloadConfiguration:<br/>caller's identity chain includes this Gateway?
+        R->>R: agent reads X-User-Authorization /<br/>X-Verified-User-Sub for OBO
         R-->>G: Agent response
         G-->>C: 200 + agent response
     end
@@ -63,7 +66,7 @@ sequenceDiagram
 
 ### 1. Inbound JWT validation (three layers)
 
-The Gateway is configured with a **`CUSTOM_JWT` inbound authorizer** pointed at the Cognito user pool's [OIDC discovery URL](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-using-auth.html), so it validates the user's JWT before doing anything else. The REQUEST interceptor **re-validates** the JWT (signature, issuer, expiry) — both as defense in depth and so it can read the `sub` claim and emit `INVALID_JWT` telemetry. Finally, the runtime is **OAuth-inbound**, so AgentCore Identity validates the same JWT a third time. The user's token reaches the agent intact, which is the prerequisite for downstream on-behalf-of (OBO) and three-legged-OAuth flows.
+The Gateway is configured with a **`CUSTOM_JWT` inbound authorizer** pointed at the Cognito user pool's [OIDC discovery URL](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-using-auth.html), so it validates the user's JWT before doing anything else. The REQUEST interceptor **re-validates** the JWT (signature, issuer, expiry) — both as defense in depth and so it can read the `sub` claim, emit `INVALID_JWT` telemetry, and forward a **trusted** user identity downstream. The runtime is also OAuth-inbound, but because the Gateway uses OAuth (client-credentials) outbound, the token AgentCore Identity validates at the runtime is the **Gateway's machine token**, not the user's. The user identity therefore reaches the agent through interceptor-injected verified headers (see control 3), which is the prerequisite for downstream on-behalf-of (OBO) and three-legged-OAuth flows.
 
 ### 2. Session ownership binding
 
@@ -77,9 +80,13 @@ runtimeSessionId = sha256(<X-Session-Id> : <jwtSub>)
 
 The hash is deterministic — the same user reusing the same UUID gets the same `runtimeSessionId`, so multi-turn conversations work without a server-side session-binding table. Two users using the same UUID get different hashes, so they cannot share session state. The interceptor injects this composite as the `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` header on the request forwarded to the runtime, and strips any client-supplied value of that header.
 
-### 3. On-behalf-of (OBO) via JWT pass-through
+### 3. On-behalf-of (OBO) via OAuth outbound + interceptor-injected verified identity
 
-The Gateway's Runtime target uses **`JWT_PASSTHROUGH`** outbound authorization: it forwards the user's `Authorization: Bearer <JWT>` unchanged to the runtime (no SigV4, no machine-to-machine token swap). The runtime is OAuth-inbound, so AgentCore Identity validates the user's token and the user identity reaches the agent. The runtime allowlists the `Authorization` header through to the agent code via `RequestHeaderConfiguration`, and `agent/handler.py` decodes the claims (without re-validating the signature — the runtime already did). This is what enables OBO and three-legged-OAuth downstream: the agent acts on behalf of the authenticated user.
+The Gateway's Runtime target uses **OAuth (client-credentials) outbound** authorization: for each request it obtains a machine-to-machine token from an **AgentCore Identity credential provider** (backed by a dedicated Cognito M2M app client) and forwards *that* token to the runtime. This Identity-brokered exchange is what stamps the Gateway's workload identity onto the request — the prerequisite for the workload lock (control 4). It also means the runtime's `Authorization` is the Gateway's token, **not** the user's.
+
+To preserve OBO, the interceptor — after it has validated the user's JWT — injects the verified user identity as `X-Verified-User-Sub` (the `sub`) and `X-User-Authorization` (the original `Bearer <JWT>`), and strips any client-supplied copies of those headers. The runtime allowlists both through to the agent via `RequestHeaderConfiguration`, and `agent/handler.py` reads `X-User-Authorization` (decoding the claims without re-validating the signature — the interceptor already did). This is what enables OBO and three-legged-OAuth downstream: the agent acts on behalf of the authenticated user.
+
+> **Why not `JWT_PASSTHROUGH`?** Pass-through relays the user's token untouched and never calls AgentCore Identity, so no workload/transaction token is attached and the workload lock (control 4) rejects every call — verified live with `Transaction token required`. OAuth outbound is the only outbound mode that satisfies `allowedWorkloadConfiguration`; the trade-off is that user identity must be propagated by the interceptor rather than by the raw token. If you need the raw user JWT to *be* the runtime's inbound credential, use an IdP that supports RFC 8693 token exchange and switch the credential provider's `grantType` to `TOKEN_EXCHANGE` (Amazon Cognito does not support token exchange).
 
 ### 4. Runtime access perimeter (workload lock)
 
@@ -118,7 +125,8 @@ sample-expose-agentcore-via-api-gateway/
 ├── bin/app.ts                          # CDK app entry point
 ├── lib/agentcore-security-stack.ts     # Single CDK stack (all resources)
 ├── lambda/
-│   ├── interceptor/index.ts            # REQUEST interceptor: JWT + composite hash + throttling
+│   ├── interceptor/index.ts            # REQUEST interceptor: JWT + composite hash + throttling + verified-identity injection
+│   ├── credential-provider/index.ts    # Custom-resource provisioner for the AgentCore Identity OAuth2 credential provider (reads M2M secret at deploy time)
 │   └── shared/types.ts                 # Shared TypeScript interfaces (interceptor payloads)
 ├── agent/
 │   ├── handler.py                      # Strands Agent (Python, deployed to Runtime) + OBO claim decode
@@ -217,7 +225,7 @@ This authenticates against Cognito, then calls the runtime data plane directly (
 npm test
 ```
 
-These verify: the Gateway has CUSTOM_JWT inbound and a REQUEST interceptor (`passRequestHeaders`); the runtime is OAuth-inbound, workload-locked (`allowedWorkloadConfiguration`), and allowlists the `Authorization` header; the Runtime target uses `JWT_PASSTHROUGH`; the interceptor keeps JWT validation + composite hashing + conditional-write throttling + fail-secure deny; the throttle table, Guardrail, and `INVALID_JWT` alarm exist; and there is no VPC, no proxy Lambda, and no API Gateway.
+These verify: the Gateway has CUSTOM_JWT inbound and a REQUEST interceptor (`passRequestHeaders`); the runtime is OAuth-inbound, workload-locked (`allowedWorkloadConfiguration`), and allowlists the verified user identity headers (`X-Verified-User-Sub` / `X-User-Authorization`); the Runtime target uses **OAUTH client-credentials outbound** via an AgentCore Identity credential provider (and no longer `JWT_PASSTHROUGH`); the M2M app client, resource server, and credential-provider provisioner exist and the M2M secret is **not** rendered into the template; the gateway role can fetch the outbound token and read the provider secret; the interceptor keeps JWT validation + composite hashing + conditional-write throttling + fail-secure deny + verified-identity injection; the throttle table, Guardrail, and `INVALID_JWT` alarm exist; and there is no VPC, no proxy Lambda, and no API Gateway.
 
 ### Manual testing with curl
 
@@ -246,15 +254,17 @@ curl -X POST "${GATEWAY_URL%/}/runtime/invocations" \
 | Resource                              | Purpose                                                                 |
 | ------------------------------------- | ----------------------------------------------------------------------- |
 | Cognito User Pool + Client            | JWT-based authentication                                                |
+| Cognito M2M client + resource server + domain | Machine-to-machine (client-credentials) identity for the Gateway's OAuth outbound token |
+| AgentCore Identity OAuth2 credential provider | Lets the Gateway obtain the outbound client-credentials token (stamps the workload identity) |
 | DynamoDB Throttle Table               | Per-user session counters and per-session invocation counters           |
 | REQUEST interceptor Lambda            | JWT validation + composite session hashing + throttling + audit logging |
 | AgentCore Gateway (protocol-less)     | Single entry point: CUSTOM_JWT inbound + interceptor + Runtime target   |
 | Gateway execution role                | Least-privilege: invoke the interceptor + the runtime only              |
-| AgentCore Runtime + Strands Agent     | AI agent, OAuth inbound, JWT pass-through, workload-locked to the Gateway |
+| AgentCore Runtime + Strands Agent     | AI agent, OAuth inbound, workload-locked to the Gateway; user identity arrives via interceptor-injected verified headers |
 | Bedrock Guardrail                     | Prompt-attack detection + PII protection                                |
 | CloudWatch Log Group / Metric Filter / Alarm | Structured audit logging + INVALID_JWT detection                |
 
-Provisioned via `AwsCustomResource` (the alpha CDK construct and CloudFormation do not yet support a protocol-less gateway, the `http.agentcoreRuntime` target, or `allowedWorkloadConfiguration`): the Gateway, its interceptor attachment, the Runtime target, and the runtime **workload lock** (applied post-create with `UpdateAgentRuntime`, because CloudFormation rejects `allowedWorkloadConfiguration` on the runtime resource with "Unsupported property"). See the deploy-time verification notes in `.kiro/steering/security-invariants.md`.
+Provisioned via `AwsCustomResource` (the alpha CDK construct and CloudFormation do not yet support a protocol-less gateway, the `http.agentcoreRuntime` target, or `allowedWorkloadConfiguration`): the Gateway, its interceptor attachment, the Runtime target, and the runtime **workload lock** (applied post-create with `UpdateAgentRuntime`, because CloudFormation rejects `allowedWorkloadConfiguration` on the runtime resource with "Unsupported property"). The **AgentCore Identity OAuth2 credential provider** is provisioned by a dedicated Lambda-backed custom resource (`lambda/credential-provider/`) so the Cognito M2M client secret is read at deploy time and never rendered into the template. See the deploy-time verification notes in `.kiro/steering/security-invariants.md`.
 
 ## Cleanup
 
@@ -271,7 +281,7 @@ Runs `cdk destroy --force`. The custom resources delete the Gateway target and G
 
 - **REQUEST interceptor holds the custom authorization logic.** The interceptor is the analog of the old Lambda Authorizer: it validates the JWT, enforces UUID format, computes the composite session hash, applies throttling, and injects the runtime session header. It is thin and fail-secure — it returns a short-circuit deny on any failure and never throws.
 
-- **`JWT_PASSTHROUGH` outbound preserves OBO.** The Gateway forwards the user's token unchanged, and the runtime stays OAuth-inbound, so the user identity reaches the agent. This is the direct replacement for the old proxy Lambda's raw JWT forwarding.
+- **OAuth (client-credentials) outbound makes the workload lock work; the interceptor preserves OBO.** `allowedWorkloadConfiguration` is only satisfied when the Gateway obtains its outbound token through AgentCore Identity, which stamps the Gateway's workload identity onto the request. `JWT_PASSTHROUGH` never calls AgentCore Identity, so it cannot satisfy the lock (verified live). Because OAuth outbound replaces the user's token with the Gateway's machine token, the interceptor forwards the verified user identity (`X-Verified-User-Sub` / `X-User-Authorization`) so the agent can still act on behalf of the user — the functional replacement for the old proxy Lambda's raw JWT forwarding.
 
 - **`allowedWorkloadConfiguration` replaces `aws:SourceVpc`.** With the VPC removed, "the call must come through my front door" is enforced by locking the runtime to the Gateway's workload identity rather than by a VPC-scoped resource policy. It is a first-class, network-independent perimeter for exactly the front-the-runtime pattern.
 
