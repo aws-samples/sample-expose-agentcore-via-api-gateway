@@ -12,8 +12,6 @@ This is a migration of the older "API Gateway + Lambda Authorizer + VPC-resident
 
 ![Architecture Diagram](img/archi.jpg)
 
-> The diagram above still shows the previous (API Gateway) topology; the request flow below is authoritative for this version.
-
 ## Request Flow
 
 ```mermaid
