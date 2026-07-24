@@ -14,7 +14,7 @@ cdk.context.json
 cdk-outputs.json
 
 # Seed script output (generated session IDs)
-scripts/seed-output.json
+**/scripts/seed-output.json
 
 # TypeScript build
 *.js
