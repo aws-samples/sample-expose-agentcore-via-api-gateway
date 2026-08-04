@@ -1,10 +1,11 @@
 #!/bin/bash
 # test-security-controls.sh — Validate the deployed security controls.
 #
-# Architecture under test (Path 1):
+# Architecture under test:
 #   Client → AgentCore Gateway (CUSTOM_JWT inbound, Cognito)
 #          → REQUEST interceptor Lambda (JWT + UUID + composite hash + throttle)
-#          → AgentCore Runtime (OAuth inbound, JWT_PASSTHROUGH, workload-locked)
+#          → AgentCore Runtime (OAuth inbound, OAUTH client-credentials
+#            outbound, workload-locked)
 #
 # Validates five boundary behaviors against the deployed stack:
 #   1. Inbound: a valid JWT + valid UUID is allowed end to end.

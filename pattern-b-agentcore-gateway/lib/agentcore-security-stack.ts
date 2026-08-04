@@ -37,13 +37,16 @@
  *   6. Prompt-layer protection       — Amazon Bedrock Guardrails (in-agent)
  *   7. Observability                 — CloudWatch logs + INVALID_JWT alarm
  *
- * NOTE ON CDK ESCAPE HATCHES: the alpha construct (2.248.0-alpha.0) is MCP-only
- * and CloudFormation still requires a protocolType on the gateway and exposes no
- * `http.agentcoreRuntime` target or `allowedWorkloadConfiguration`. Path 1 needs
- * a protocol-less gateway with a Runtime HTTP target and the workload lock, so
- * the Gateway, its interceptor, its Runtime target, and the workload restriction
- * are provisioned via AwsCustomResource against bedrock-agentcore-control — the
- * same pattern the sample already used for the runtime resource policy.
+ * NOTE ON CDK ESCAPE HATCHES: the alpha construct (2.248.0-alpha.0) is MCP-only,
+ * so the protocol-less Gateway (with its interceptor attachment) and the Runtime
+ * HTTP target are provisioned via AwsCustomResource against
+ * bedrock-agentcore-control. The workload lock (allowedWorkloadConfiguration)
+ * and the request-header allowlist are both supported by the
+ * AWS::BedrockAgentCore::Runtime CloudFormation schema and are applied as
+ * property overrides on the L1 runtime resource. (CloudFormation has since also
+ * added Gateway interceptorConfigurations and an optional ProtocolType, so the
+ * remaining custom resources can migrate to native resources as the CDK
+ * constructs catch up.)
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -416,13 +419,13 @@ export class AgentCoreSecurityStack extends cdk.Stack {
         // Don't wedge rollback if the gateway was never created / already gone.
         ignoreErrorCodesMatching: 'ValidationException|ResourceNotFoundException|AccessDeniedException',
       },
-      // All bedrock-agentcore control-plane actions used by ANY of the three
-      // custom resources are granted here, on the FIRST custom resource. All
-      // three share one provider role, and this policy is proven to propagate
-      // before its own CreateGateway call succeeds — so by the time the target
-      // and workload-lock calls run, the shared role already carries these
-      // permissions. This avoids the IAM eventual-consistency race that occurs
-      // when each custom resource relies on its own just-created inline policy.
+      // All bedrock-agentcore control-plane actions used by BOTH custom
+      // resources are granted here, on the FIRST custom resource. Both share
+      // one provider role, and this policy is proven to propagate before its
+      // own CreateGateway call succeeds — so by the time the target call runs,
+      // the shared role already carries these permissions. This avoids the IAM
+      // eventual-consistency race that occurs when each custom resource relies
+      // on its own just-created inline policy.
       policy: AwsCustomResourcePolicy.fromStatements([
         new iam.PolicyStatement({
           actions: [
@@ -433,8 +436,6 @@ export class AgentCoreSecurityStack extends cdk.Stack {
             'bedrock-agentcore:CreateGatewayTarget',
             'bedrock-agentcore:DeleteGatewayTarget',
             'bedrock-agentcore:GetGatewayTarget',
-            'bedrock-agentcore:UpdateAgentRuntime',
-            'bedrock-agentcore:GetAgentRuntime',
             // CreateGateway creates the gateway's workload identity synchronously
             // using the CALLER's credentials (this provider role), so the caller
             // — not just the gateway execution role — needs these.
@@ -446,12 +447,9 @@ export class AgentCoreSecurityStack extends cdk.Stack {
           ],
           resources: ['*'],
         }),
-        // iam:PassRole for the roles this stack passes to the bedrock-agentcore
-        // service: the gateway role (CreateGateway) and the runtime execution
-        // role (UpdateAgentRuntime). Scoped to this stack's roles and gated on
-        // the service they're passed to. Placed on the gateway CR (the reliably
-        // early-propagating policy on the shared provider role) so all three
-        // custom resources are authorized without an IAM propagation race.
+        // iam:PassRole for the gateway execution role this stack passes to the
+        // bedrock-agentcore service on CreateGateway. Scoped to this stack's
+        // roles and gated on the service they're passed to.
         new iam.PolicyStatement({
           actions: ['iam:PassRole'],
           resources: [`arn:aws:iam::${this.account}:role/${this.stackName}-*`],
@@ -480,20 +478,15 @@ export class AgentCoreSecurityStack extends cdk.Stack {
 
     // =====================================================================
     // AGENTCORE RUNTIME — OAuth inbound (Cognito). Two escape-hatch props are
-    // layered onto the underlying CfnRuntime:
-    //   - allowedWorkloadConfiguration → locks invocation to this Gateway
+    // layered onto the underlying CfnRuntime (both supported by the
+    // AWS::BedrockAgentCore::Runtime schema, but not yet surfaced by the
+    // alpha construct):
+    //   - AllowedWorkloadConfiguration → locks invocation to this Gateway
     //     (replaces the old aws:SourceVpc perimeter).
-    //   - requestHeaderConfiguration   → allowlist Authorization so the passed-
-    //     through JWT reaches the agent for OBO claim extraction.
+    //   - RequestHeaderConfiguration   → allowlist the interceptor-injected
+    //     verified identity headers so they reach the agent for OBO.
     // =====================================================================
 
-    // The Strands agent code, uploaded to the CDK asset bucket. Declared
-    // explicitly (rather than via AgentRuntimeArtifact.fromCodeAsset, which
-    // creates the asset lazily during synth) so we hold a concrete reference:
-    // the RuntimeWorkloadLock custom resource below re-supplies this artifact
-    // to UpdateAgentRuntime, and AgentCore retrieves the zip from S3 using the
-    // CALLER's credentials — so the custom-resource provider role must be
-    // granted read on this object (see the grant on RuntimeWorkloadLock).
     const agentCodeAsset = new s3assets.Asset(this, 'AgentCodeAsset', {
       path: path.join(__dirname, '..', '.build', 'agent'),
     });
@@ -529,15 +522,20 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     // through to the agent. The runtime's own Authorization now carries the
     // Gateway's M2M token (not the user's), so the user identity is propagated
     // via these headers, which the interceptor sets only after validating the
-    // user's JWT. (RequestHeaderConfiguration IS supported by the CFN resource.)
+    // user's JWT.
     cfnRuntime.addPropertyOverride('RequestHeaderConfiguration.RequestHeaderAllowlist', ['X-Verified-User-Sub', 'X-User-Authorization']);
 
-    // Perimeter (allowedWorkloadConfiguration) is applied AFTER creation via an
-    // UpdateAgentRuntime custom resource below, because the CloudFormation
-    // AWS::BedrockAgentCore::Runtime schema does not yet accept
-    // AllowedWorkloadConfiguration ("Unsupported property"). See the workload-lock
-    // custom resource further down and the deploy-time notes in
-    // .kiro/steering/security-invariants.md.
+    // Perimeter (workload lock): only requests whose identity chain includes
+    // this Gateway may invoke the runtime. AllowedWorkloadConfiguration is now
+    // part of the AWS::BedrockAgentCore::Runtime CloudFormation schema (it was
+    // previously rejected as "Unsupported property", which forced a post-create
+    // UpdateAgentRuntime custom resource), so the lock is applied natively at
+    // create time — the runtime is never live without its perimeter. The alpha
+    // construct does not surface it yet, hence the property override.
+    cfnRuntime.addPropertyOverride(
+      'AuthorizerConfiguration.CustomJWTAuthorizer.AllowedWorkloadConfiguration.HostingEnvironments',
+      [{ Arn: gatewayArn }],
+    );
 
     // Grant the runtime's execution role permission to invoke the Bedrock model
     // and apply the guardrail.
@@ -638,85 +636,6 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     targetCr.node.addDependency(credentialProviderCr);
 
     // =====================================================================
-    // RUNTIME WORKLOAD LOCK (via AwsCustomResource) — apply
-    // allowedWorkloadConfiguration to the runtime AFTER creation, because the
-    // CloudFormation resource schema rejects the property at create time.
-    // UpdateAgentRuntime is a full PUT, so we re-supply the artifact, network,
-    // role, and header allowlist and add the workload restriction to the
-    // authorizer. The artifact is reused from the L1 (camelCase codeConfiguration).
-    // =====================================================================
-
-    const workloadLockAuthorizer = {
-      customJWTAuthorizer: {
-        discoveryUrl,
-        // The runtime validates the Gateway's outbound client-credentials token
-        // (client_id = M2M app client), not the end-user token.
-        allowedClients: [m2mClient.userPoolClientId],
-        allowedWorkloadConfiguration: {
-          hostingEnvironments: [{ arn: gatewayArn }],
-        },
-      },
-    };
-    // Verified user identity headers the interceptor injects (after validating
-    // the user JWT) are allowlisted through to the agent for OBO.
-    const runtimeHeaderAllowlist = { requestHeaderAllowlist: ['X-Verified-User-Sub', 'X-User-Authorization'] };
-
-    const runtimeWorkloadLock = new AwsCustomResource(this, 'RuntimeWorkloadLock', {
-      onCreate: {
-        service: 'bedrock-agentcore-control',
-        action: 'UpdateAgentRuntime',
-        parameters: {
-          agentRuntimeId: agentRuntime.agentRuntimeId,
-          agentRuntimeArtifact: cfnRuntime.agentRuntimeArtifact,
-          networkConfiguration: { networkMode: 'PUBLIC' },
-          roleArn: agentRuntime.role.roleArn,
-          authorizerConfiguration: workloadLockAuthorizer,
-          requestHeaderConfiguration: runtimeHeaderAllowlist,
-        },
-        physicalResourceId: PhysicalResourceId.of(`${agentRuntime.agentRuntimeId}#workload-lock`),
-      },
-      onUpdate: {
-        service: 'bedrock-agentcore-control',
-        action: 'UpdateAgentRuntime',
-        parameters: {
-          agentRuntimeId: agentRuntime.agentRuntimeId,
-          agentRuntimeArtifact: cfnRuntime.agentRuntimeArtifact,
-          networkConfiguration: { networkMode: 'PUBLIC' },
-          roleArn: agentRuntime.role.roleArn,
-          authorizerConfiguration: workloadLockAuthorizer,
-          requestHeaderConfiguration: runtimeHeaderAllowlist,
-        },
-        physicalResourceId: PhysicalResourceId.of(`${agentRuntime.agentRuntimeId}#workload-lock`),
-      },
-      // No onDelete — the runtime (and thus its config) is deleted with the stack.
-      policy: AwsCustomResourcePolicy.fromStatements([
-        new iam.PolicyStatement({
-          actions: ['bedrock-agentcore:UpdateAgentRuntime'],
-          resources: [agentRuntime.agentRuntimeArn, `${agentRuntime.agentRuntimeArn}/*`],
-        }),
-        new iam.PolicyStatement({
-          actions: ['iam:PassRole'],
-          resources: [agentRuntime.role.roleArn],
-        }),
-        // UpdateAgentRuntime is a full PUT that re-supplies the S3 code artifact.
-        // AgentCore retrieves/validates that zip from S3 using the CALLER's
-        // credentials (this custom-resource provider role), so it must be able
-        // to read the agent code object. Without this, UpdateAgentRuntime fails
-        // with "Access denied when trying to retrieve zip file from S3" — even
-        // though CreateRuntime (run by the privileged CFN execution role)
-        // succeeded. Scoped to just the agent code object.
-        new iam.PolicyStatement({
-          actions: ['s3:GetObject', 's3:GetObjectVersion'],
-          resources: [agentCodeAsset.bucket.arnForObjects(agentCodeAsset.s3ObjectKey)],
-        }),
-      ]),
-      installLatestAwsSdk: true,
-    });
-    runtimeWorkloadLock.node.addDependency(agentRuntime);
-    runtimeWorkloadLock.node.addDependency(gatewayCr);
-    runtimeWorkloadLock.node.addDependency(targetCr);
-
-    // =====================================================================
     // MONITORING — INVALID_JWT metric filter + alarm on the interceptor logs.
     // =====================================================================
 
@@ -806,7 +725,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
 
     // AgentCore control-plane custom resources need bedrock-agentcore:* on '*'
     // because gateway/target ARNs are server-generated and not known at synth.
-    for (const cr of ['AgentCoreGateway', 'AgentCoreGatewayTarget', 'RuntimeWorkloadLock']) {
+    for (const cr of ['AgentCoreGateway', 'AgentCoreGatewayTarget']) {
       const crNode = this.node.tryFindChild(cr);
       if (crNode) {
         NagSuppressions.addResourceSuppressions(crNode, [

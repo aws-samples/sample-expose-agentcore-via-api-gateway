@@ -1,10 +1,11 @@
 #!/bin/bash
 # deploy.sh — Deploy the AgentCore Runtime Security Sample stack.
 #
-# Architecture (Path 1 — OAuth inbound + JWT pass-through):
+# Architecture (OAuth inbound + OAUTH client-credentials outbound):
 #   Client → AgentCore Gateway (CUSTOM_JWT inbound, Cognito)
 #          → REQUEST interceptor Lambda (JWT + UUID + composite hash + throttle)
-#          → AgentCore Runtime (OAuth inbound, JWT_PASSTHROUGH outbound)
+#          → AgentCore Runtime (OAuth inbound; Gateway uses OAUTH
+#            client-credentials outbound via AgentCore Identity)
 #   The Runtime is locked to this Gateway via allowedWorkloadConfiguration.
 #
 # Usage:
