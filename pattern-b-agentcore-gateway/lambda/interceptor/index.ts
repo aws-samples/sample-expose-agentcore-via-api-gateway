@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
 /**
  * AgentCore Gateway REQUEST interceptor — JWT validation, composite session
  * hashing, per-user / per-session throttling, and structured audit logging.
