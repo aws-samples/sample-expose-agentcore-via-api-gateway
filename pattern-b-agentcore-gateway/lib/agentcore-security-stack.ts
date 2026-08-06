@@ -87,7 +87,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     // =====================================================================
 
     const userPool = new cognito.UserPool(this, 'UserPool', {
-      userPoolName: 'agentcore-security-users',
+      userPoolName: `agentcore-security-users-${uniqueSuffix}`,
       selfSignUpEnabled: false,
       signInAliases: { email: true },
       autoVerify: { email: true },
@@ -448,11 +448,14 @@ export class AgentCoreSecurityStack extends cdk.Stack {
           resources: ['*'],
         }),
         // iam:PassRole for the gateway execution role this stack passes to the
-        // bedrock-agentcore service on CreateGateway. Scoped to this stack's
-        // roles and gated on the service they're passed to.
+        // bedrock-agentcore service on CreateGateway. Scoped to the exact role
+        // ARN (NOT a `role/${stackName}-*` name pattern — CloudFormation
+        // truncates generated role names to 64 chars, so long stack names get
+        // clipped and the pattern silently stops matching) and gated on the
+        // service it's passed to.
         new iam.PolicyStatement({
           actions: ['iam:PassRole'],
-          resources: [`arn:aws:iam::${this.account}:role/${this.stackName}-*`],
+          resources: [gatewayRole.roleArn],
           conditions: {
             StringEquals: { 'iam:PassedToService': 'bedrock-agentcore.amazonaws.com' },
           },
@@ -492,7 +495,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     });
 
     const agentRuntime = new agentcore.Runtime(this, 'AgentCoreRuntime', {
-      runtimeName: 'securitySampleAgent',
+      runtimeName: 'securitySampleAgentB',
       description: 'Strands agent for the security reference architecture',
       authorizerConfiguration: agentcore.RuntimeAuthorizerConfiguration.usingCognito(
         userPool,
@@ -558,14 +561,20 @@ export class AgentCoreSecurityStack extends cdk.Stack {
       resources: [guardrail.attrGuardrailArn],
     }));
 
-    // The Gateway execution role must be able to invoke the Runtime target.
+    // The Gateway execution role must be able to invoke the Runtime target,
+    // and to describe it: the gateway calls GetAgentRuntime asynchronously
+    // when the target is attached ("Failed to resolve runtime fields") — the
+    // target goes FAILED without it.
     // Use a literal runtime-wildcard ARN (not agentRuntime.agentRuntimeArn) so
     // this policy does NOT create a dependency edge on the Runtime resource —
     // the Runtime depends on the Gateway (for the workload lock), and the
     // Gateway custom resource passes this role, so referencing the concrete
     // Runtime ARN here would form a create-time dependency cycle.
     gatewayRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['bedrock-agentcore:InvokeAgentRuntime'],
+      actions: [
+        'bedrock-agentcore:InvokeAgentRuntime',
+        'bedrock-agentcore:GetAgentRuntime',
+      ],
       resources: [`arn:aws:bedrock-agentcore:${this.region}:${this.account}:runtime/*`],
     }));
 
@@ -648,7 +657,7 @@ export class AgentCoreSecurityStack extends cdk.Stack {
     });
 
     new cloudwatch.Alarm(this, 'InvalidJwtAlarm', {
-      alarmName: 'AgentCore-InvalidJwt-High',
+      alarmName: `AgentCore-InvalidJwt-High-${uniqueSuffix}`,
       alarmDescription: 'Triggered when invalid JWT denials exceed threshold',
       metric: invalidJwtFilter.metric({ statistic: 'Sum', period: cdk.Duration.minutes(5) }),
       threshold: 5,

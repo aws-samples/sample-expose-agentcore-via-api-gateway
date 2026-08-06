@@ -7,7 +7,9 @@ import { AgentCoreSecurityStack } from '../lib/agentcore-security-stack';
 const app = new cdk.App();
 cdk.Aspects.of(app).add(new AwsSolutionsChecks({ verbose: true }));
 
-new AgentCoreSecurityStack(app, 'AgentCoreSecurityStack', {
+// Local test-run override: distinct stack name so we don't touch the existing
+// AgentCoreSecurityStack (Pattern A) already deployed in this account/region.
+new AgentCoreSecurityStack(app, 'AgentCoreSecurityStackPatternB', {
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',

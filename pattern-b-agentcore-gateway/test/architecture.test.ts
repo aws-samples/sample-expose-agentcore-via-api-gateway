@@ -98,7 +98,9 @@ describe('AgentCore Gateway: CUSTOM_JWT inbound + REQUEST interceptor', () => {
     template.hasResourceProperties('AWS::IAM::Policy', {
       PolicyDocument: Match.objectLike({
         Statement: Match.arrayWith([
-          Match.objectLike({ Action: 'bedrock-agentcore:InvokeAgentRuntime' }),
+          Match.objectLike({
+            Action: Match.arrayWith(['bedrock-agentcore:InvokeAgentRuntime', 'bedrock-agentcore:GetAgentRuntime']),
+          }),
         ]),
       }),
     });
@@ -267,7 +269,9 @@ describe('REQUEST interceptor code: JWT + composite hash + throttling + fail-sec
 
 describe('Supporting resources: Cognito, DynamoDB, Guardrail, monitoring, outputs', () => {
   test('Cognito UserPool, DynamoDB throttle table, Bedrock Guardrail, INVALID_JWT alarm all exist', () => {
-    template.hasResourceProperties('AWS::Cognito::UserPool', { UserPoolName: 'agentcore-security-users' });
+    template.hasResourceProperties('AWS::Cognito::UserPool', {
+      UserPoolName: Match.stringLikeRegexp('^agentcore-security-users-'),
+    });
     template.hasResourceProperties('AWS::DynamoDB::Table', {
       KeySchema: Match.arrayWith([Match.objectLike({ AttributeName: 'pk', KeyType: 'HASH' })]),
       TimeToLiveSpecification: { AttributeName: 'expiresAt', Enabled: true },
