@@ -9,7 +9,8 @@
  * Security invariants encoded here:
  *   - Gateway has CUSTOM_JWT inbound + a REQUEST interceptor (passRequestHeaders)
  *   - Runtime is OAuth inbound AND locked to this Gateway via
- *     allowedWorkloadConfiguration (the perimeter that replaces aws:SourceVpc)
+ *     AllowedWorkloadConfiguration, set natively on the CloudFormation runtime
+ *     resource (the perimeter that replaces aws:SourceVpc)
  *   - Runtime target uses OAUTH client-credentials outbound (via an AgentCore
  *     Identity credential provider) — the Identity-brokered path that lets the
  *     workload lock be satisfied (JWT pass-through cannot satisfy it)
@@ -97,14 +98,16 @@ describe('AgentCore Gateway: CUSTOM_JWT inbound + REQUEST interceptor', () => {
     template.hasResourceProperties('AWS::IAM::Policy', {
       PolicyDocument: Match.objectLike({
         Statement: Match.arrayWith([
-          Match.objectLike({ Action: 'bedrock-agentcore:InvokeAgentRuntime' }),
+          Match.objectLike({
+            Action: Match.arrayWith(['bedrock-agentcore:InvokeAgentRuntime', 'bedrock-agentcore:GetAgentRuntime']),
+          }),
         ]),
       }),
     });
   });
 });
 
-describe('AgentCore Runtime: OAuth inbound + workload lock + JWT passthrough target', () => {
+describe('AgentCore Runtime: OAuth inbound + workload lock + OAuth outbound target', () => {
   test('Runtime is OAuth inbound (CustomJWTAuthorizer, Cognito discovery URL)', () => {
     template.hasResourceProperties('AWS::BedrockAgentCore::Runtime', {
       AuthorizerConfiguration: Match.objectLike({
@@ -119,20 +122,22 @@ describe('AgentCore Runtime: OAuth inbound + workload lock + JWT passthrough tar
     });
   });
 
-  test('Runtime is locked to the Gateway workload via allowedWorkloadConfiguration (perimeter)', () => {
-    // CloudFormation does not accept AllowedWorkloadConfiguration on the runtime
-    // resource, so the workload lock is applied post-create via an
-    // UpdateAgentRuntime custom resource.
+  test('Runtime is locked to the Gateway workload via AllowedWorkloadConfiguration (perimeter)', () => {
+    // AllowedWorkloadConfiguration is set natively on the CloudFormation
+    // runtime resource (the schema supports it), so the runtime is never live
+    // without its perimeter.
+    template.hasResourceProperties('AWS::BedrockAgentCore::Runtime', {
+      AuthorizerConfiguration: Match.objectLike({
+        CustomJWTAuthorizer: Match.objectLike({
+          AllowedWorkloadConfiguration: Match.objectLike({
+            HostingEnvironments: Match.arrayWith([Match.objectLike({ Arn: Match.anyValue() })]),
+          }),
+        }),
+      }),
+    });
+    // The old post-create UpdateAgentRuntime workaround must be gone.
     const upd = customResourceCreatePayloads().find((p) => p.includes('UpdateAgentRuntime'));
-    expect(upd).toBeDefined();
-    expect(upd).toContain('allowedWorkloadConfiguration');
-    expect(upd).toContain('hostingEnvironments');
-    // And it must NOT be (incorrectly) left on the CFN runtime resource.
-    const runtimes = template.findResources('AWS::BedrockAgentCore::Runtime');
-    for (const r of Object.values(runtimes)) {
-      const authz = r.Properties?.AuthorizerConfiguration?.CustomJWTAuthorizer ?? {};
-      expect(authz.AllowedWorkloadConfiguration).toBeUndefined();
-    }
+    expect(upd).toBeUndefined();
   });
 
   test('Runtime allowlists the verified user identity headers for OBO (RequestHeaderConfiguration)', () => {
@@ -193,10 +198,13 @@ describe('OAuth outbound identity: M2M client, credential provider, gateway toke
     });
   });
 
-  test('Runtime validates the M2M client token (allowedClients set via the workload-lock update)', () => {
-    const upd = customResourceCreatePayloads().find((p) => p.includes('UpdateAgentRuntime'));
-    expect(upd).toBeDefined();
-    expect(upd).toContain('allowedClients');
+  test('Runtime validates the M2M client token (AllowedClients on the runtime authorizer)', () => {
+    const runtimes = template.findResources('AWS::BedrockAgentCore::Runtime');
+    const allowedClients = Object.values(runtimes)
+      .map((r) => r.Properties?.AuthorizerConfiguration?.CustomJWTAuthorizer?.AllowedClients)
+      .find(Boolean);
+    expect(allowedClients).toBeDefined();
+    expect(allowedClients).toHaveLength(1);
   });
 });
 
@@ -261,7 +269,9 @@ describe('REQUEST interceptor code: JWT + composite hash + throttling + fail-sec
 
 describe('Supporting resources: Cognito, DynamoDB, Guardrail, monitoring, outputs', () => {
   test('Cognito UserPool, DynamoDB throttle table, Bedrock Guardrail, INVALID_JWT alarm all exist', () => {
-    template.hasResourceProperties('AWS::Cognito::UserPool', { UserPoolName: 'agentcore-security-users' });
+    template.hasResourceProperties('AWS::Cognito::UserPool', {
+      UserPoolName: Match.stringLikeRegexp('^agentcore-security-users-'),
+    });
     template.hasResourceProperties('AWS::DynamoDB::Table', {
       KeySchema: Match.arrayWith([Match.objectLike({ AttributeName: 'pk', KeyType: 'HASH' })]),
       TimeToLiveSpecification: { AttributeName: 'expiresAt', Enabled: true },
