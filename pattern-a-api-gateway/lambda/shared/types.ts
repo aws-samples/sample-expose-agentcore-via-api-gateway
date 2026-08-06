@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
 /**
  * Decoded JWT claims from a Cognito-issued ID token.
  * The `sub` field is the key identity claim used to derive the composite

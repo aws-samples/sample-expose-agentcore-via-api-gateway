@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 # deploy.sh — Deploy the AgentCore Runtime Security Sample stack.
 #
 # Architecture (OAuth inbound + OAUTH client-credentials outbound):

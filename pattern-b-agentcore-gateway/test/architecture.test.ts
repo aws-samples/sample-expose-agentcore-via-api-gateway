@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
 /**
  * Tests for the AgentCore security architecture:
  *   Client → AgentCore Gateway (CUSTOM_JWT inbound, Cognito)

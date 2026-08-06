@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
 /**
  * AgentCoreSecurityStack — defense-in-depth for Amazon Bedrock AgentCore Runtime,
  * fronted by an AgentCore Gateway (MCP-less HTTP target) instead of API Gateway.
@@ -445,7 +448,14 @@ export class AgentCoreSecurityStack extends cdk.Stack {
             'bedrock-agentcore:DeleteWorkloadIdentity',
             'bedrock-agentcore:ListWorkloadIdentities',
           ],
-          resources: ['*'],
+          // Gateway/target/workload-identity ids are server-generated and not
+          // known at synth, so scope by account+region ARN pattern rather than
+          // exact resource (targets are sub-resources of gateways).
+          resources: [
+            `arn:aws:bedrock-agentcore:${this.region}:${this.account}:gateway/*`,
+            `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default`,
+            `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default/workload-identity/*`,
+          ],
         }),
         // iam:PassRole for the gateway execution role this stack passes to the
         // bedrock-agentcore service on CreateGateway. Scoped to the exact role
@@ -635,7 +645,10 @@ export class AgentCoreSecurityStack extends cdk.Stack {
             'bedrock-agentcore:DeleteGatewayTarget',
             'bedrock-agentcore:GetGatewayTarget',
           ],
-          resources: ['*'],
+          // Targets are sub-resources of gateways; ids are server-generated.
+          resources: [
+            `arn:aws:bedrock-agentcore:${this.region}:${this.account}:gateway/*`,
+          ],
         }),
       ]),
       installLatestAwsSdk: true,
@@ -732,8 +745,9 @@ export class AgentCoreSecurityStack extends cdk.Stack {
       },
     ], true);
 
-    // AgentCore control-plane custom resources need bedrock-agentcore:* on '*'
-    // because gateway/target ARNs are server-generated and not known at synth.
+    // AgentCore control-plane custom resources address gateways/targets by
+    // account+region ARN pattern because their ids are server-generated and
+    // not known at synth.
     for (const cr of ['AgentCoreGateway', 'AgentCoreGatewayTarget']) {
       const crNode = this.node.tryFindChild(cr);
       if (crNode) {

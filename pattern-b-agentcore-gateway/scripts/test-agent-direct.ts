@@ -1,4 +1,7 @@
 #!/usr/bin/env ts-node
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
 /**
  * Direct AgentCore Runtime invocation test (JWT, bypassing the Gateway).
  *

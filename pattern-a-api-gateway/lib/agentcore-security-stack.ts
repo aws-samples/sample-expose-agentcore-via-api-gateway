@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
 /**
  * AgentCoreSecurityStack — defense-in-depth for Amazon Bedrock AgentCore Runtime.
  *
